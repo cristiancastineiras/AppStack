@@ -1,0 +1,47 @@
+[package]
+name = "appstack"
+version = "1.0.0"
+edition = "2024"
+description = "A native Windows application group launcher"
+license = "MIT"
+rust-version = "1.85"
+autobins = false
+
+[[bin]]
+name = "AppStackClassic"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+quick-xml = { version = "0.38", features = ["serialize"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico", "bmp"] }
+
+[build-dependencies]
+embed-resource = "3"
+resvg = "0.45"
+ico = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm",
+    "Win32_System_Com", "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange", "Win32_System_LibraryLoader",
+    "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Registry",
+    "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs",
+    "Win32_Storage_FileSystem",
+    "Win32_Security", "Win32_System_SystemServices", "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell",
+    "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
