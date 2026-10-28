@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800" viewBox="0 0 64 64" role="img" aria-labelledby="title description">
+	<title id="title">AppStack - Ribbon</title>
+	<desc id="description">Una S escalonada como una cinta de tres capas plegadas, de cristal cian a azul profundo, con relieve de tiles.</desc>
+	<defs>
+		<linearGradient id="ribbon-material" x1="12" y1="8" x2="52" y2="56" gradientUnits="userSpaceOnUse">
+			<stop stop-color="#C5F8FF"/>
+			<stop offset=".4" stop-color="#38C5F4"/>
+			<stop offset=".75" stop-color="#1479DD"/>
+			<stop offset="1" stop-color="#103C9D"/>
+		</linearGradient>
+		<linearGradient id="top-face" x1="12" y1="8" x2="52" y2="24" gradientUnits="userSpaceOnUse">
+			<stop stop-color="#ECFDFF"/>
+			<stop offset="1" stop-color="#67D8F7"/>
+		</linearGradient>
+		<linearGradient id="middle-face" x1="16" y1="24" x2="48" y2="40" gradientUnits="userSpaceOnUse">
+			<stop stop-color="#1783D6"/>
+			<stop offset=".5" stop-color="#39C4F1"/>
+			<stop offset="1" stop-color="#A2F1FF"/>
+		</linearGradient>
+		<g id="tile">
+			<rect x=".5" y=".5" width="3" height="3" fill="#075B98" opacity=".04"/>
+			<rect x=".5" y=".5" width="1.5" height="1.5" fill="#075B98" opacity=".045"/>
+		</g>
+		<pattern id="tile-relief" width="8" height="8" patternUnits="userSpaceOnUse">
+			<use href="#tile"/>
+			<use href="#tile" transform="translate(4 0) rotate(90 2 2)"/>
+			<use href="#tile" transform="translate(0 4) rotate(270 2 2)"/>
+			<use href="#tile" transform="translate(4 4) rotate(180 2 2)"/>
+		</pattern>
+		<path id="ribbon" d="M17.2 8H50.8Q52 8 52 9.2V18.8Q52 20 50.8 20H24V24H42.8Q44 24 44 25.2V28H50.8Q52 28 52 29.2V32H54.8Q56 32 56 33.2V42.8Q56 44 54.8 44H52V50.8Q52 52 50.8 52H48V54.8Q48 56 46.8 56H13.2Q12 56 12 54.8V45.2Q12 44 13.2 44H40V40H21.2Q20 40 20 38.8V36H13.2Q12 36 12 34.8V32H9.2Q8 32 8 30.8V21.2Q8 20 9.2 20H12V13.2Q12 12 13.2 12H16V9.2Q16 8 17.2 8Z"/>
+		<clipPath id="ribbon-outline">
+			<use href="#ribbon"/>
+		</clipPath>
+	</defs>
+	<g id="appstack">
+		<use href="#ribbon" fill="url(#ribbon-material)"/>
+		<g clip-path="url(#ribbon-outline)">
+			<path d="M8 8H56V20H24V24H8Z" fill="url(#top-face)"/>
+			<path d="M8 24H44V28H52V32H56V40H40V36H20V32H8Z" fill="url(#middle-face)"/>
+			<path d="M17.2 8.5H50.8M24 24.5H42.8M13.2 44.5H40" fill="none" stroke="#FFFFFF" stroke-opacity=".55" stroke-width=".6"/>
+		</g>
+		<use href="#ribbon" fill="url(#tile-relief)"/>
+	</g>
+</svg>

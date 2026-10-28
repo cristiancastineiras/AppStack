@@ -1,0 +1,2 @@
+[alias]
+classic = "build --release --bin AppStackClassic"
