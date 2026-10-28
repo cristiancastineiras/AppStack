@@ -167,6 +167,189 @@ pub(super) fn button_positions(
         .collect()
 }
 
+/// Ready-made looks for the group editor: each sets every Interface field by its label, starting
+/// from a neutral base, so picking one always gives the same popup.
+fn popup_styles() -> Vec<(String, Vec<(String, String)>)> {
+    const BASE: &[(&str, &str)] = &[
+        ("Columns", "4"),
+        ("Icon size", "32"),
+        ("Horizontal gap", "4"),
+        ("Vertical gap", "4"),
+        ("Side padding", "12"),
+        ("Vertical padding", "12"),
+        ("Popup rounding", "12"),
+        ("Tile rounding", "8"),
+        ("Layout", "0"),
+        ("Accent color (optional)", ""),
+        ("Show icon labels", "true"),
+        ("Labels", "0"),
+        ("Label size", "12"),
+        ("Show group header", "true"),
+        ("Header", "0"),
+        ("Show Edit button", "true"),
+        ("Show Launch all button", "true"),
+        ("Buttons", "0"),
+        ("Button alignment", "2"),
+        ("Scroll inside the group", "false"),
+        ("Visible rows", "3"),
+        ("Minimum width", "0"),
+        ("Border width", "1"),
+        ("Border color (optional)", ""),
+        ("Shadow", "2"),
+    ];
+    let icons_only: &[(&str, &str)] = &[
+        ("Show icon labels", "false"),
+        ("Show group header", "false"),
+        ("Show Edit button", "false"),
+        ("Show Launch all button", "false"),
+    ];
+    let styles: [(&str, Vec<(&str, &str)>); 8] = [
+        (
+            "Dock",
+            [
+                icons_only,
+                &[
+                    ("Columns", "8"),
+                    ("Icon size", "48"),
+                    ("Horizontal gap", "8"),
+                    ("Side padding", "8"),
+                    ("Vertical padding", "8"),
+                    ("Popup rounding", "9999"),
+                    ("Tile rounding", "9999"),
+                    ("Shadow", "3"),
+                ],
+            ]
+            .concat(),
+        ),
+        (
+            "Bubble",
+            [
+                icons_only,
+                &[
+                    ("Columns", "1"),
+                    ("Side padding", "8"),
+                    ("Vertical padding", "8"),
+                    ("Popup rounding", "9999"),
+                    ("Tile rounding", "9999"),
+                    ("Scroll inside the group", "true"),
+                    ("Visible rows", "4"),
+                    ("Border width", "0"),
+                    ("Shadow", "4"),
+                ],
+            ]
+            .concat(),
+        ),
+        (
+            "List",
+            vec![
+                ("Columns", "1"),
+                ("Icon size", "24"),
+                ("Horizontal gap", "0"),
+                ("Vertical gap", "0"),
+                ("Side padding", "8"),
+                ("Vertical padding", "8"),
+                ("Labels", "1"),
+                ("Label size", "14"),
+                ("Buttons", "1"),
+                ("Scroll inside the group", "true"),
+                ("Visible rows", "8"),
+            ],
+        ),
+        (
+            "Cards",
+            vec![
+                ("Columns", "3"),
+                ("Icon size", "48"),
+                ("Horizontal gap", "8"),
+                ("Vertical gap", "8"),
+                ("Side padding", "16"),
+                ("Vertical padding", "16"),
+                ("Popup rounding", "16"),
+                ("Tile rounding", "12"),
+                ("Layout", "1"),
+                ("Shadow", "3"),
+            ],
+        ),
+        (
+            "Launchpad",
+            vec![
+                ("Columns", "5"),
+                ("Icon size", "64"),
+                ("Horizontal gap", "12"),
+                ("Vertical gap", "12"),
+                ("Side padding", "24"),
+                ("Vertical padding", "24"),
+                ("Popup rounding", "24"),
+                ("Tile rounding", "16"),
+                ("Label size", "14"),
+                ("Button alignment", "1"),
+                ("Border width", "0"),
+                ("Shadow", "5"),
+            ],
+        ),
+        (
+            "Minimal",
+            [
+                icons_only,
+                &[
+                    ("Horizontal gap", "0"),
+                    ("Vertical gap", "0"),
+                    ("Side padding", "8"),
+                    ("Vertical padding", "8"),
+                    ("Popup rounding", "0"),
+                    ("Tile rounding", "4"),
+                    ("Border width", "0"),
+                    ("Shadow", "1"),
+                ],
+            ]
+            .concat(),
+        ),
+        (
+            "Indigo",
+            vec![
+                ("Icon size", "48"),
+                ("Horizontal gap", "8"),
+                ("Vertical gap", "8"),
+                ("Side padding", "16"),
+                ("Vertical padding", "16"),
+                ("Popup rounding", "24"),
+                ("Tile rounding", "9999"),
+                ("Layout", "1"),
+                ("Accent color (optional)", "#6366F1"),
+                ("Border width", "2"),
+                ("Border color (optional)", "#6366F1"),
+                ("Shadow", "4"),
+            ],
+        ),
+        (
+            "Sunset",
+            vec![
+                ("Icon size", "48"),
+                ("Horizontal gap", "8"),
+                ("Popup rounding", "9999"),
+                ("Tile rounding", "9999"),
+                ("Accent color (optional)", "#F97316"),
+                ("Border width", "1"),
+                ("Border color (optional)", "#FB923C"),
+                ("Button alignment", "1"),
+                ("Shadow", "3"),
+            ],
+        ),
+    ];
+    let owned = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(label, value)| (label.to_string(), value.to_string()))
+            .collect::<Vec<_>>()
+    };
+    std::iter::once(("Choose a style…".to_string(), Vec::new()))
+        .chain(styles.into_iter().map(|(name, changes)| {
+            // Later pairs win when the form applies them, so the style overrides the base.
+            (name.to_string(), owned(&[BASE, &changes].concat()))
+        }))
+        .collect()
+}
+
 fn apply_group_values(group: &mut Group, values: &[String]) -> Result<(), String> {
     if values.len() != 30 {
         return Err("The group settings are incomplete".into());
@@ -998,6 +1181,7 @@ impl Application {
                 appearance.show_on_tray,
             ),
             Field::page("Interface"),
+            Field::style("Popup style", popup_styles()),
             Field::preset(
                 "Columns",
                 &[
@@ -3427,6 +3611,21 @@ impl Drop for Application {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_styles_each_set_the_same_known_fields() {
+        let styles = popup_styles();
+        assert!(styles[0].1.is_empty(), "the first entry only prompts");
+        fn labels(pairs: &[(String, String)]) -> HashSet<&str> {
+            pairs.iter().map(|(label, _)| label.as_str()).collect()
+        }
+        // A misspelled label in one style would add a field the others do not have.
+        let expected = labels(&styles[1].1);
+        assert!(expected.contains("Shadow") && expected.contains("Popup rounding"));
+        for (name, pairs) in &styles[1..] {
+            assert_eq!(labels(pairs), expected, "{name}");
+        }
+    }
 
     #[test]
     fn size_selects_map_legacy_measurements_to_named_presets() {

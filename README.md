@@ -62,9 +62,15 @@ after rebuilding; Explorer may retain its own icon cache until it refreshes.
   `auto`, spacing has `none`, and rounding follows Tailwind-style tokens from
   `none` through `4xl` and `full`. Full rounding creates a real pill, like CSS
   `rounded-full`: the round ends span the popup's short side and only the long
-  side gets extra room so the content clears them. Custom radii have
-  anti-aliased edges and a hairline border.
+  side gets extra room so the content clears them. Every popup has anti-aliased
+  edges, a border (`0`, `1`, `2`, `4` or `8` pixels, inside the padding like
+  Tailwind's border-box) and a shadow from Tailwind's `sm` through `2xl` scale.
+  Accent and border colors are typed as `#RRGGBB` or picked from the Windows
+  color picker beside each field; empty follows the theme.
   Sizes follow monitor DPI and the popup remains constrained to the work area.
+- **Popup style** at the top of Interface fills in every Interface setting with a
+  ready-made look (Dock, Bubble, List, Cards, Launchpad, Minimal, Indigo or
+  Sunset), which can then be adjusted before **Save**.
 - A live preview beside the settings shows the group's labels, icons, spacing,
   actions and rounding as controls change. Icons load asynchronously using the
   existing workers. Preview changes are not persisted until **Save**; **Cancel**
@@ -85,8 +91,10 @@ after rebuilding; Explorer may retain its own icon cache until it refreshes.
   `text-overflow: ellipsis`; the full name appears as a tooltip.
 - Preferences choose the folder title font and the icon label font. Space Grotesk
   (titles) and Inter (labels) are embedded and are the defaults; any installed font
-  can be selected. **Pointer cursor over popup icons** shows the hand cursor over
-  applications, like CSS `cursor: pointer`.
+  can be selected. **Hand cursor on clickable popup items** (on by default) shows
+  the hand over applications, buttons and page dots, like CSS `cursor: pointer`.
+  **Popup animations** fades each popup in as it rises a few pixels and pops its
+  icons in one after another.
 - Main and popup themes are independent, including dark buttons, scroll bars,
   lists, dialogs and context menus. High contrast takes precedence over custom
   colors. The manager's menu bar stays light because Win32 does not theme it.

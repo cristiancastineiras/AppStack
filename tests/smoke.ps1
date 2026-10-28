@@ -248,13 +248,13 @@ if ($EditorOnly) {
                 [AppStackSmokeV2]::PostMessage($manager,0x111,[IntPtr]102,[IntPtr]::Zero) | Out-Null
                 $form = [AppStackSmokeV2]::WaitWindow('AppStack.Form','Edit group',$process.Id)
                 [AppStackLayoutV4]::SelectTab($form,'Interface')
-                [AppStackSmokeV2]::WaitFor([Func[bool]]{ return [AppStackSmokeV2]::IsWindowVisible([AppStackLayoutV4]::GetDlgItem($form,128)) },$process.Id,10000)
+                [AppStackSmokeV2]::WaitFor([Func[bool]]{ return [AppStackSmokeV2]::IsWindowVisible([AppStackLayoutV4]::GetDlgItem($form,129)) },$process.Id,10000)
                 $preview = [AppStackLayoutV4]::GetDlgItem($form,50)
                 if ($preview -eq [IntPtr]::Zero) { throw 'Live preview is missing' }
                 $before = Join-Path $root ('preview-before-' + $action + '.png')
                 $after = Join-Path $root ('preview-after-' + $action + '.png')
                 [AppStackSmokeV2]::Screenshot($preview,$before)
-                foreach ($setting in @(@(108,'2xl'),@(109,'lg'),@(110,'md'),@(111,'xl'),@(112,'xl'),@(113,'full'),@(114,'full'),@(115,'Card'),@(128,'2xl'))) {
+                foreach ($setting in @(@(109,'2xl'),@(110,'lg'),@(111,'md'),@(112,'xl'),@(113,'xl'),@(114,'full'),@(115,'full'),@(116,'Card'),@(129,'2xl'))) {
                     Set-EditorPreset $form $setting[0] $setting[1] $process.Id
                 }
                 [AppStackSmokeV2]::Screenshot($preview,$after)
@@ -390,8 +390,8 @@ if ($EditorOnly) {
             (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Interface')))
         if ($null -eq $interface) { [AppStackLayoutV4]::SelectTab($form,'Interface') }
         else { ([System.Windows.Automation.SelectionItemPattern]$interface.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)).Select() }
-        [AppStackSmokeV2]::WaitFor([Func[bool]]{ return [AppStackSmokeV2]::IsWindowVisible([AppStackLayoutV4]::GetDlgItem($form,128)) },$process.Id,10000)
-        foreach ($setting in @(@(108,'2xl'),@(109,'lg'),@(110,'md'),@(111,'xl'),@(112,'xl'),@(113,'3xl'),@(114,'xl'),@(128,'2xl'))) {
+        [AppStackSmokeV2]::WaitFor([Func[bool]]{ return [AppStackSmokeV2]::IsWindowVisible([AppStackLayoutV4]::GetDlgItem($form,129)) },$process.Id,10000)
+        foreach ($setting in @(@(109,'2xl'),@(110,'lg'),@(111,'md'),@(112,'xl'),@(113,'xl'),@(114,'3xl'),@(115,'xl'),@(129,'2xl'))) {
             Set-EditorPreset $form $setting[0] $setting[1] $process.Id
         }
         foreach ($label in @('Save','Cancel')) {

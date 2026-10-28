@@ -738,9 +738,7 @@ unsafe fn custom_draw(draw: &NMLVCUSTOMDRAW) -> Option<LRESULT> {
     let selected = state & LVIS_SELECTED.0 != 0;
     let hot = look.hot == index as i32;
     // While the popup opens, each icon fades and scales in after the previous one.
-    let progress = look
-        .spawn
-        .map_or(1.0, |start| spawn_progress(start, index));
+    let progress = look.spawn.map_or(1.0, |start| spawn_progress(start, index));
     if progress <= 0.0 {
         return Some(LRESULT(CDRF_SKIPDEFAULT as isize));
     }
@@ -1942,9 +1940,35 @@ pub enum Field {
         values: Vec<String>,
         selected: usize,
     },
+    /// Named looks that fill in other fields, by label, with values in `form_values` form.
+    /// It only fills the form, so it adds nothing to the returned values.
+    Style {
+        label: String,
+        values: Vec<String>,
+        settings: Vec<Vec<(String, String)>>,
+    },
 }
 
 impl Field {
+    fn label(&self) -> &str {
+        match self {
+            Field::Preset { label, .. }
+            | Field::Page { label }
+            | Field::Text { label, .. }
+            | Field::Color { label, .. }
+            | Field::Check { label, .. }
+            | Field::Choice { label, .. }
+            | Field::Style { label, .. } => label,
+        }
+    }
+    pub fn style(label: &str, styles: Vec<(String, Vec<(String, String)>)>) -> Self {
+        let (values, settings) = styles.into_iter().unzip();
+        Self::Style {
+            label: label.into(),
+            values,
+            settings,
+        }
+    }
     pub fn preset(label: &str, presets: &[(&str, u32)], value: u32) -> Self {
         Self::Preset {
             label: label.into(),
@@ -2400,6 +2424,54 @@ unsafe fn paint_preview_buffered(window: HWND, item: &DRAWITEMSTRUCT, preview: &
     let _ = DeleteDC(dc);
 }
 
+/// Fills the fields a chosen style names, as if the user had set each one.
+fn apply_style(fields: &[Field], controls: &[Option<HWND>], index: usize) {
+    let (Some(Field::Style { settings, .. }), Some(Some(control))) =
+        (fields.get(index), controls.get(index))
+    else {
+        return;
+    };
+    let chosen = send(*control, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0.max(0) as usize;
+    for (label, value) in settings.get(chosen).into_iter().flatten() {
+        let Some((field, Some(control))) = fields
+            .iter()
+            .zip(controls)
+            .find(|(field, _)| field.label() == label)
+        else {
+            continue;
+        };
+        match field {
+            Field::Text { .. } | Field::Color { .. } => set_text(*control, value),
+            Field::Check { .. } => {
+                send(
+                    *control,
+                    BM_SETCHECK,
+                    WPARAM(usize::from(value == "true")),
+                    LPARAM(0),
+                );
+            }
+            Field::Choice { .. } => {
+                send(
+                    *control,
+                    CB_SETCURSEL,
+                    WPARAM(value.parse().unwrap_or(0)),
+                    LPARAM(0),
+                );
+            }
+            Field::Preset { measurements, .. } => {
+                let value = value.parse::<u32>().unwrap_or(0);
+                let nearest = measurements
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, measurement)| measurement.abs_diff(value))
+                    .map_or(0, |(index, _)| index);
+                send(*control, CB_SETCURSEL, WPARAM(nearest), LPARAM(0));
+            }
+            Field::Page { .. } | Field::Style { .. } => {}
+        }
+    }
+}
+
 fn form_values(fields: &[Field], controls: &[Option<HWND>]) -> Vec<String> {
     fields
         .iter()
@@ -2419,7 +2491,7 @@ fn form_values(fields: &[Field], controls: &[Option<HWND>]) -> Vec<String> {
                     .copied()
                     .unwrap_or_default()
                     .to_string(),
-                Field::Page { .. } => return None,
+                Field::Page { .. } | Field::Style { .. } => return None,
             })
         })
         .collect()
@@ -2433,6 +2505,8 @@ struct FormState {
     preview: RefCell<Option<GroupPreview>>,
     preview_window: Cell<HWND>,
     preview_dirty: Cell<bool>,
+    /// A list whose selection the user just changed, as a field index.
+    chosen: Cell<Option<usize>>,
 }
 
 impl FormState {
@@ -2517,6 +2591,9 @@ unsafe extern "system" fn form_procedure(
         if code == WM_COMMAND {
             let id = (first.0 & 0xFFFF) as i32;
             let notification = (first.0 >> 16) as u32;
+            if id >= 100 && notification == CBN_SELCHANGE {
+                (*state).chosen.set(Some(id as usize - 100));
+            }
             if id >= i32::from(SWATCH) && notification == BN_CLICKED {
                 if let Ok(edit) = GetDlgItem(Some(window), id - i32::from(SWATCH)) {
                     pick_color(window, edit);
@@ -3088,17 +3165,9 @@ pub fn form_with_preview(
                     send(control, BM_SETCHECK, WPARAM(usize::from(*value)), LPARAM(0));
                     control
                 }
-                Field::Choice {
-                    label,
-                    values,
-                    selected,
-                }
-                | Field::Preset {
-                    label,
-                    values,
-                    selected,
-                    ..
-                } => {
+                Field::Choice { label, values, .. }
+                | Field::Preset { label, values, .. }
+                | Field::Style { label, values, .. } => {
                     let label = child(window, w!("STATIC"), label, 0, WINDOW_STYLE(0), &font)?;
                     pages[page].push(label);
                     place(
@@ -3131,7 +3200,13 @@ pub fn form_with_preview(
                             LPARAM(wide(value).as_ptr() as isize),
                         );
                     }
-                    send(control, CB_SETCURSEL, WPARAM(*selected), LPARAM(0));
+                    let selected = match field {
+                        Field::Choice { selected, .. } | Field::Preset { selected, .. } => {
+                            *selected
+                        }
+                        _ => 0,
+                    };
+                    send(control, CB_SETCURSEL, WPARAM(selected), LPARAM(0));
                     control
                 }
                 Field::Page { .. } => unreachable!(),
@@ -3215,6 +3290,10 @@ pub fn form_with_preview(
             {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
+            }
+            if let Some(index) = state.chosen.take() {
+                apply_style(fields, &controls, index);
+                state.preview_dirty.set(true);
             }
             if let Some(update) = live_preview.as_mut() {
                 let preview = state.preview.borrow_mut().take();
