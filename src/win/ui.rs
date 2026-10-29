@@ -36,6 +36,7 @@ pub const ASYNC: u32 = WM_APP + 13;
 pub const TRAY: u32 = WM_APP + 14;
 pub const DROP: u32 = WM_APP + 15;
 pub const INVOKE_ITEM: u32 = WM_APP + 16;
+pub const DRAG: u32 = WM_APP + 17;
 
 #[derive(Debug)]
 pub struct Event {
