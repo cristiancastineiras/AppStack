@@ -38,11 +38,11 @@ cargo test --all-targets --locked
 ```
 
 For changes to popups or the editor, also run the UI smoke tests described in
-the README's **Verification** section and look at the screenshots they write.
+the **Verification** section of [docs/REFERENCE.md](docs/REFERENCE.md) and look at the screenshots they write.
 
 Keep changes focused: one fix or feature per pull request, written like the
 code around it (plain Win32 through the `windows` crate; no new runtime or UI
-framework). Mention any user-visible change in the README.
+framework). Mention any user-visible change in [docs/REFERENCE.md](docs/REFERENCE.md) (and in the README when it changes the overview).
 
 ## Sharing a community style
 
