@@ -277,6 +277,7 @@ pub fn run() -> Result<(), String> {
     ui::register("AppStack.Popup", Some(ui::procedure))?;
     ui::register("AppStack.Viewport", Some(ui::procedure))?;
     ui::register("AppStack.Edge", Some(ui::edge_procedure))?;
+    ui::register("AppStack.Slide", Some(ui::slide_procedure))?;
     ui::register_form()?;
     startup_stage!("window_classes");
     let host = ui::window(

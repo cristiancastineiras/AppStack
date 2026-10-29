@@ -68,6 +68,8 @@ thread_local! {
     static MENU_DARK: Cell<bool> = const { Cell::new(false) };
     /// When the last forwarded request arrived, in `epoch_us`, for APPSTACK_STARTUP_TRACE.
     static RECEIVED: Cell<u128> = const { Cell::new(0) };
+    /// Folder slides in progress, by the window drawing each.
+    static SLIDES: RefCell<HashMap<usize, Slide>> = RefCell::new(HashMap::new());
     // Icon lists act on the first click; this remembers it so the double-click is not acted on again.
     static LAST_CLICK: Cell<Option<(usize, std::time::Instant)>> = const { Cell::new(None) };
     // Closed-hand drag cursor and the cursor size it was built for.
@@ -1603,6 +1605,283 @@ unsafe fn step_pop(window: HWND) {
             }
         });
     }
+}
+
+const SLIDE_TIMER: usize = 0x534C;
+/// Seconds a folder change takes, and how far the content travels at 96 DPI.
+const SLIDE_SECONDS: f32 = 0.16;
+const SLIDE_PIXELS: i32 = 36;
+
+/// A list's pixels at one moment, for a folder change to slide between.
+struct Snapshot {
+    bitmap: HBITMAP,
+    width: i32,
+    height: i32,
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(self.bitmap.into());
+        }
+    }
+}
+
+/// Renders a list as it is now through WM_PRINT, the path AnimateWindow uses, so pixels hidden
+/// under a slide still come out right.
+unsafe fn snapshot(list: HWND) -> Option<Snapshot> {
+    let mut bounds = RECT::default();
+    GetClientRect(list, &mut bounds).ok()?;
+    let (width, height) = (bounds.right, bounds.bottom);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let screen = GetDC(Some(list));
+    let memory = CreateCompatibleDC(Some(screen));
+    let bitmap = CreateCompatibleBitmap(screen, width, height);
+    ReleaseDC(Some(list), screen);
+    let previous = SelectObject(memory, bitmap.into());
+    send(
+        list,
+        WM_PRINT,
+        WPARAM(memory.0 as usize),
+        LPARAM((PRF_CLIENT | PRF_ERASEBKGND | PRF_CHILDREN) as isize),
+    );
+    SelectObject(memory, previous);
+    let _ = DeleteDC(memory);
+    Some(Snapshot {
+        bitmap,
+        width,
+        height,
+    })
+}
+
+/// A folder change in progress, drawn by a click-through window over the list.
+struct Slide {
+    list: HWND,
+    old: Snapshot,
+    /// The new folder, and when the slide began; none while the folder is still loading.
+    new: Option<(Snapshot, std::time::Instant)>,
+    forward: bool,
+}
+
+/// Covers a list with a picture of its current folder before that folder changes underneath,
+/// so loading the next one never shows. `slide_folder` then moves from one to the other.
+pub fn freeze_folder(list: HWND) -> bool {
+    unsafe {
+        cancel_slide(list);
+        let (Some(old), Ok(viewport)) = (snapshot(list), GetParent(list)) else {
+            return false;
+        };
+        let Ok(overlay) = window(
+            "AppStack.Slide",
+            "",
+            WS_CHILD,
+            WINDOW_EX_STYLE(0),
+            Some(viewport),
+            old.width,
+            old.height,
+        ) else {
+            return false;
+        };
+        if SetPropW(list, w!("AppStack.Slide"), Some(HANDLE(overlay.0))).is_err() {
+            let _ = DestroyWindow(overlay);
+            return false;
+        }
+        SLIDES.with_borrow_mut(|slides| {
+            slides.insert(
+                overlay.0 as usize,
+                Slide {
+                    list,
+                    old,
+                    new: None,
+                    forward: true,
+                },
+            )
+        });
+        cover(list, overlay);
+        let _ = UpdateWindow(overlay);
+        true
+    }
+}
+
+/// Places the slide window exactly over the list, above it.
+unsafe fn cover(list: HWND, overlay: HWND) {
+    let mut bounds = RECT::default();
+    let _ = GetWindowRect(list, &mut bounds);
+    let mut corners = [
+        POINT {
+            x: bounds.left,
+            y: bounds.top,
+        },
+        POINT {
+            x: bounds.right,
+            y: bounds.bottom,
+        },
+    ];
+    if let Ok(viewport) = GetParent(list) {
+        MapWindowPoints(None, Some(viewport), &mut corners);
+    }
+    let _ = SetWindowPos(
+        overlay,
+        Some(HWND_TOP),
+        corners[0].x,
+        corners[0].y,
+        corners[1].x - corners[0].x,
+        corners[1].y - corners[0].y,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    );
+}
+
+/// Slides from the frozen folder to the list's new one: into a subfolder (`forward`) the old
+/// content leaves to the left and the new one comes from the right, and back the other way.
+/// The list underneath already holds the new folder, focus and clicks throughout.
+pub fn slide_folder(list: HWND, forward: bool) {
+    unsafe {
+        let overlay = HWND(GetPropW(list, w!("AppStack.Slide")).0);
+        let new = snapshot(list);
+        let started = SLIDES.with_borrow_mut(|slides| {
+            let slide = slides.get_mut(&(overlay.0 as usize))?;
+            slide.new = Some((new?, std::time::Instant::now()));
+            slide.forward = forward;
+            Some(())
+        });
+        if started.is_none() {
+            cancel_slide(list);
+            return;
+        }
+        // The folder may have changed the popup's height or the list's width.
+        cover(list, overlay);
+        SetTimer(Some(overlay), SLIDE_TIMER, 15, None);
+        let _ = InvalidateRect(Some(overlay), None, false);
+    }
+}
+
+/// Ends a list's folder slide at once, showing the list itself.
+pub fn cancel_slide(list: HWND) {
+    unsafe {
+        let overlay = HWND(
+            RemovePropW(list, w!("AppStack.Slide"))
+                .unwrap_or_default()
+                .0,
+        );
+        if !overlay.is_invalid() {
+            let _ = DestroyWindow(overlay);
+            // The list is already in its final state; repaint where the slide was at once.
+            let _ = UpdateWindow(list);
+        }
+    }
+}
+
+pub unsafe extern "system" fn slide_procedure(
+    window: HWND,
+    code: u32,
+    first: WPARAM,
+    second: LPARAM,
+) -> LRESULT {
+    match code {
+        // Clicks and the wheel reach the list underneath, which already shows the new folder.
+        WM_NCHITTEST => return LRESULT(HTTRANSPARENT as isize),
+        WM_ERASEBKGND => return LRESULT(1),
+        WM_PAINT => {
+            paint_slide(window);
+            return LRESULT(0);
+        }
+        WM_TIMER if first.0 == SLIDE_TIMER => {
+            let state = SLIDES.with_borrow(|slides| {
+                slides.get(&(window.0 as usize)).map(|slide| {
+                    let done = slide
+                        .new
+                        .as_ref()
+                        .is_some_and(|(_, start)| start.elapsed().as_secs_f32() >= SLIDE_SECONDS);
+                    (slide.list, done)
+                })
+            });
+            match state {
+                // A popup closed mid-slide ends it, so a reopened one shows its real list.
+                Some((list, done)) if done || !IsWindowVisible(window).as_bool() => {
+                    cancel_slide(list)
+                }
+                Some(_) => {
+                    let _ = InvalidateRect(Some(window), None, false);
+                }
+                None => {
+                    let _ = KillTimer(Some(window), SLIDE_TIMER);
+                }
+            }
+            return LRESULT(0);
+        }
+        WM_NCDESTROY => {
+            SLIDES.with_borrow_mut(|slides| slides.remove(&(window.0 as usize)));
+        }
+        _ => {}
+    }
+    DefWindowProcW(window, code, first, second)
+}
+
+unsafe fn paint_slide(window: HWND) {
+    let mut paint = PAINTSTRUCT::default();
+    let dc = BeginPaint(window, &mut paint);
+    let mut bounds = RECT::default();
+    let _ = GetClientRect(window, &mut bounds);
+    let (width, height) = (bounds.right, bounds.bottom);
+    let background = COLORS
+        .with_borrow(|colors| {
+            colors
+                .get(&(GetAncestor(window, GA_ROOT).0 as usize))
+                .copied()
+        })
+        .map_or(GetSysColor(COLOR_WINDOW), |(background, _)| background);
+    // Drawn off screen and copied once, so no frame shows a half-drawn mix.
+    let buffer = CreateCompatibleDC(Some(dc));
+    let canvas = CreateCompatibleBitmap(dc, width, height);
+    let previous = SelectObject(buffer, canvas.into());
+    SetDCBrushColor(buffer, COLORREF(background));
+    FillRect(buffer, &bounds, HBRUSH(GetStockObject(DC_BRUSH).0));
+    SLIDES.with_borrow(|slides| {
+        let Some(slide) = slides.get(&(window.0 as usize)) else {
+            return;
+        };
+        let source = CreateCompatibleDC(Some(dc));
+        let draw = |picture: &Snapshot, left: i32, opacity: f32| {
+            let alpha = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+            if alpha == 0 {
+                return;
+            }
+            let previous = SelectObject(source, picture.bitmap.into());
+            let (w, h) = (picture.width, picture.height);
+            if alpha == 255 {
+                let _ = BitBlt(buffer, left, 0, w, h, Some(source), 0, 0, SRCCOPY);
+            } else {
+                let blend = BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    SourceConstantAlpha: alpha,
+                    ..Default::default()
+                };
+                let _ = AlphaBlend(buffer, left, 0, w, h, source, 0, 0, w, h, blend);
+            }
+            SelectObject(source, previous);
+        };
+        match &slide.new {
+            None => draw(&slide.old, 0, 1.0),
+            Some((new, start)) => {
+                // Decelerates into place, like the popup's own opening.
+                let t = (start.elapsed().as_secs_f32() / SLIDE_SECONDS).min(1.0);
+                let eased = 1.0 - (1.0 - t).powi(3);
+                let travel = scale(SLIDE_PIXELS, GetDpiForWindow(window).max(96)).min(width / 4)
+                    as f32
+                    * if slide.forward { 1.0 } else { -1.0 };
+                draw(&slide.old, (-travel * eased).round() as i32, 1.0 - eased);
+                draw(new, (travel * (1.0 - eased)).round() as i32, eased);
+            }
+        }
+        let _ = DeleteDC(source);
+    });
+    let _ = BitBlt(dc, 0, 0, width, height, Some(buffer), 0, 0, SRCCOPY);
+    SelectObject(buffer, previous);
+    let _ = DeleteObject(canvas.into());
+    let _ = DeleteDC(buffer);
+    let _ = EndPaint(window, &paint);
 }
 
 pub fn register(class: &str, procedure: WNDPROC) -> Result<(), String> {
