@@ -3116,7 +3116,9 @@ impl Application {
                 WC_LISTVIEWW,
                 "Applications",
                 20,
+                // Clipping siblings keeps it from painting over a folder slide's window.
                 WS_TABSTOP
+                    | WS_CLIPSIBLINGS
                     | WINDOW_STYLE(
                         LVS_NOSCROLL
                             | LVS_SINGLESEL
@@ -3614,7 +3616,8 @@ impl Application {
         Ok(false)
     }
 
-    /// Opens a subfolder inside its popup like the Start menu, or goes back with `None`.
+    /// Opens a subfolder inside its popup like the Start menu, or goes back with `None`. With
+    /// popup animations on, the content slides between the two folders inside the list.
     fn navigate(&mut self, index: usize, id: Option<&str>) -> Result<(), String> {
         let Some(popup) = self.popups.get_mut(index) else {
             return Ok(());
@@ -3625,11 +3628,29 @@ impl Application {
                 popup.path.pop();
             }
         }
-        self.show_folder(index)
+        let list = popup.list;
+        let slide = self.config.settings.animations
+            && unsafe { IsWindowVisible(popup.window).as_bool() }
+            && ui::freeze_folder(list);
+        let result = self.load_folder(index);
+        if slide {
+            match result {
+                Ok(()) => ui::slide_folder(list, id.is_some()),
+                Err(_) => ui::cancel_slide(list),
+            }
+        }
+        result
+    }
+
+    /// Shows the popup's current folder at once, ending any slide: for reopening, drops and
+    /// other changes that are not navigation.
+    fn show_folder(&mut self, index: usize) -> Result<(), String> {
+        ui::cancel_slide(self.popups[index].list);
+        self.load_folder(index)
     }
 
     /// Loads the popup's current folder in place, keeping the root group's layout.
-    fn show_folder(&mut self, index: usize) -> Result<(), String> {
+    fn load_folder(&mut self, index: usize) -> Result<(), String> {
         let popup = &self.popups[index];
         let group = self
             .config
