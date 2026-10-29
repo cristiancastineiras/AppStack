@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.3.0](https://github.com/cristiancastineiras/AppStack/compare/v1.2.0...v1.3.0) (2026-10-29)
+
+
+### Features
+
+* **docs:** add comprehensive technical reference for AppStack ([bcc3919](https://github.com/cristiancastineiras/AppStack/commit/bcc391967a8d21db7fdd8454b016645796996149))
+* **docs:** update CONTRIBUTING and REFERENCE documentation; add README file with project overview and features ([99dafbf](https://github.com/cristiancastineiras/AppStack/commit/99dafbf7e5b1e576e13d98990c12c81bb9256fa7))
+* **images:** add various images and screenshots for documentation and demo purposes ([99dafbf](https://github.com/cristiancastineiras/AppStack/commit/99dafbf7e5b1e576e13d98990c12c81bb9256fa7))
+
 ## [1.2.0](https://github.com/cristiancastineiras/AppStack/compare/v1.1.0...v1.2.0) (2026-10-29)
 
 
