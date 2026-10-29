@@ -2520,7 +2520,7 @@ pub enum Field {
 }
 
 impl Field {
-    fn label(&self) -> &str {
+    pub fn label(&self) -> &str {
         match self {
             Field::Preset { label, .. }
             | Field::Page { label }
@@ -2529,6 +2529,20 @@ impl Field {
             | Field::Check { label, .. }
             | Field::Choice { label, .. }
             | Field::Style { label, .. } => label,
+        }
+    }
+    /// What `form_values` returns for the field before anything is changed.
+    pub fn value(&self) -> Option<String> {
+        match self {
+            Field::Text { value, .. } | Field::Color { value, .. } => Some(value.clone()),
+            Field::Check { value, .. } => Some(value.to_string()),
+            Field::Choice { selected, .. } => Some(selected.to_string()),
+            Field::Preset {
+                measurements,
+                selected,
+                ..
+            } => measurements.get(*selected).map(u32::to_string),
+            Field::Page { .. } | Field::Style { .. } => None,
         }
     }
     pub fn style(label: &str, styles: Vec<(String, Vec<(String, String)>)>) -> Self {

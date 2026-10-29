@@ -46,6 +46,10 @@ const SHORTCUT_FOLDER: u16 = 107;
 const GROUP_UP: u16 = 108;
 const GROUP_DOWN: u16 = 109;
 const GROUP_ICON: u16 = 110;
+const SAVE_STYLE: u16 = 111;
+const EXPORT_STYLE: u16 = 112;
+const IMPORT_STYLE: u16 = 113;
+const DELETE_STYLE: u16 = 114;
 const ADD_FILES: u16 = 201;
 const ADD_MANUAL: u16 = 202;
 const ADD_SUBGROUP: u16 = 203;
@@ -450,9 +454,26 @@ fn font_themes(fonts: &[String]) -> Vec<(String, Vec<(String, String)>)> {
         .collect()
 }
 
+/// The repository's community styles as of this build, for the first run and offline use.
+const COMMUNITY: &str = include_str!("../../styles/community.json");
+
+/// A look as the Popup style select applies it: every field from the Style tab on, with the
+/// value the editor would show for this appearance.
+fn style_settings(appearance: &Appearance) -> Vec<(String, String)> {
+    let group = Group {
+        appearance: appearance.clone(),
+        ..Group::default()
+    };
+    group_fields(&group, Vec::new())
+        .iter()
+        .skip_while(|field| field.label() != "Style")
+        .filter_map(|field| Some((field.label().to_string(), field.value()?)))
+        .collect()
+}
+
 /// The group editor's fields. Two columns per tab, filled row by row: keep related settings in
-/// pairs, and keep apply_group_values' indices in this order.
-fn group_fields(group: &Group) -> Vec<Field> {
+/// pairs, and keep apply_group_values' indices in this order. `styles` fills Popup style.
+fn group_fields(group: &Group, styles: Vec<(String, Vec<(String, String)>)>) -> Vec<Field> {
     let appearance = &group.appearance;
     vec![
         Field::page("General"),
@@ -473,7 +494,7 @@ fn group_fields(group: &Group) -> Vec<Field> {
             appearance.show_on_tray,
         ),
         Field::page("Style"),
-        Field::style("Popup style", popup_styles()),
+        Field::style("Popup style", styles),
         Field::choice(
             "Layout",
             &["Compact", "Card"],
@@ -827,6 +848,7 @@ impl Application {
         }
         if self.config.settings.check_updates {
             self.job(Job::CheckUpdate(false));
+            self.job(Job::FetchStyles);
         }
         // AppStack usually stays resident, so it also looks again every day.
         unsafe {
@@ -1159,6 +1181,10 @@ impl Application {
                         (DELETE_GROUP, "Delete"),
                         (OPEN_GROUP, "Open popup"),
                         (GROUP_ICON, "Choose group icon..."),
+                        (SAVE_STYLE, "Save popup style..."),
+                        (EXPORT_STYLE, "Share popup style as a file..."),
+                        (IMPORT_STYLE, "Import popup style..."),
+                        (DELETE_STYLE, "Delete saved style..."),
                         (SHORTCUT, "Create desktop shortcut"),
                         (SHORTCUT_FOLDER, "Open shortcut location"),
                         (GROUP_UP, "Move up"),
@@ -1411,13 +1437,143 @@ impl Application {
         Ok(())
     }
 
+    /// Popup style choices: the built-in looks, then saved styles and community styles.
+    fn style_choices(&self) -> Vec<(String, Vec<(String, String)>)> {
+        // The downloaded copy brings styles added after this build.
+        let community = std::fs::read(self.store.root.join(update::COMMUNITY_STYLES))
+            .ok()
+            .and_then(|bytes| read_styles(&bytes).ok())
+            .or_else(|| read_styles(COMMUNITY.as_bytes()).ok())
+            .unwrap_or_default();
+        let mut choices = popup_styles();
+        for style in &self.config.styles {
+            choices.push((
+                format!("Saved: {}", style.name),
+                style_settings(&style.appearance),
+            ));
+        }
+        for style in &community {
+            let name = if style.author.is_empty() {
+                format!("Community: {}", style.name)
+            } else {
+                format!("Community: {} by {}", style.name, style.author)
+            };
+            choices.push((name, style_settings(&style.appearance)));
+        }
+        choices
+    }
+
+    /// Saves, shares and removes popup looks from the manager's Group menu.
+    fn style_command(&mut self, id: u16) -> Result<(), String> {
+        match id {
+            IMPORT_STYLE => {
+                let Some(path) = shell::select_files(self.owner(), false, false)?
+                    .into_iter()
+                    .next()
+                else {
+                    return Ok(());
+                };
+                let file = std::fs::File::open(&path).map_err(failure)?;
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::Read::take(file, 1 << 20), &mut bytes)
+                    .map_err(failure)?;
+                let styles = read_styles(&bytes)?;
+                let mut candidate = self.config.clone();
+                let count = styles.len();
+                for style in styles {
+                    candidate.keep_style(style);
+                }
+                self.commit(candidate)?;
+                shell::message(
+                    Some(self.owner()),
+                    "Styles imported",
+                    &format!(
+                        "Imported {count} style(s). Choose them under Popup style when you edit a group."
+                    ),
+                    false,
+                );
+                Ok(())
+            }
+            DELETE_STYLE => {
+                if self.config.styles.is_empty() {
+                    shell::message(
+                        Some(self.owner()),
+                        "AppStack",
+                        "There are no saved styles yet.",
+                        false,
+                    );
+                    return Ok(());
+                }
+                let fields = [Field::Choice {
+                    label: "Saved style".into(),
+                    values: self
+                        .config
+                        .styles
+                        .iter()
+                        .map(|style| style.name.clone())
+                        .collect(),
+                    selected: 0,
+                }];
+                if let Some(values) = self.form("Delete saved style", &fields)? {
+                    let index: usize = values[0].parse().map_err(failure)?;
+                    let mut candidate = self.config.clone();
+                    if index < candidate.styles.len() {
+                        candidate.styles.remove(index);
+                        self.commit(candidate)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                let group = self.selected_group().ok_or("No group selected")?;
+                let style = Style {
+                    name: group.name.clone(),
+                    author: String::new(),
+                    appearance: group.appearance.clone(),
+                };
+                if id == EXPORT_STYLE {
+                    let file = style
+                        .name
+                        .replace(|c: char| r#"<>:"/\|?*"#.contains(c), "_");
+                    let Some(path) = shell::save_file(
+                        self.owner(),
+                        &format!("{file}.json"),
+                        ("AppStack style", "json"),
+                    )?
+                    else {
+                        return Ok(());
+                    };
+                    let mut shared = style;
+                    // A group's own icon path is personal and plays no part in the look.
+                    shared.appearance.icon.clear();
+                    let bytes = serde_json::to_vec_pretty(&shared).map_err(failure)?;
+                    return std::fs::write(path, bytes).map_err(failure);
+                }
+                let fields = [
+                    Field::text("Style name", &style.name),
+                    Field::text("Author (optional, shown when shared)", ""),
+                ];
+                let Some(values) = self.form("Save style", &fields)? else {
+                    return Ok(());
+                };
+                let mut candidate = self.config.clone();
+                candidate.keep_style(Style {
+                    name: values[0].trim().into(),
+                    author: values[1].trim().into(),
+                    ..style
+                });
+                self.commit(candidate)
+            }
+        }
+    }
+
     fn edit_group(&mut self, create: bool) -> Result<(), String> {
         let mut group = if create {
             Group::default()
         } else {
             self.selected_group().ok_or("No group selected")?.clone()
         };
-        let fields = group_fields(&group);
+        let fields = group_fields(&group, self.style_choices());
         let mut preview_icons = Vec::new();
         let mut requested_icons = Vec::new();
         let mut loaded_icons = HashSet::new();
@@ -1807,6 +1963,7 @@ impl Application {
                 }
                 Ok(())
             }
+            SAVE_STYLE | EXPORT_STYLE | IMPORT_STYLE | DELETE_STYLE => self.style_command(id),
             OPEN_GROUP => {
                 let group = self.selected_group().ok_or("No group selected")?.id.clone();
                 let mut point = POINT::default();
@@ -1876,7 +2033,11 @@ impl Application {
                 Ok(())
             }
             EXPORT => {
-                if let Some(path) = shell::save_file(self.owner(), "AppStack-backup.agz")? {
+                if let Some(path) = shell::save_file(
+                    self.owner(),
+                    "AppStack-backup.agz",
+                    ("AppStack backup", "agz"),
+                )? {
                     self.job(Job::Export(self.config.clone(), path));
                 }
                 Ok(())
@@ -2285,6 +2446,7 @@ impl Application {
             WM_TIMER if event.first == UPDATES && event.window == self.host => {
                 if self.config.settings.check_updates {
                     self.job(Job::CheckUpdate(false));
+                    self.job(Job::FetchStyles);
                 }
                 Ok(())
             }
@@ -4275,6 +4437,23 @@ mod tests {
         for (name, pairs) in &styles[1..] {
             assert_eq!(labels(pairs), expected, "{name}");
         }
+        // Saved and community styles fill exactly the same fields as the built-in ones.
+        let saved = style_settings(&Appearance::default());
+        assert_eq!(labels(&saved), expected);
+    }
+
+    #[test]
+    fn bundled_community_styles_are_valid_and_apply_their_look() {
+        let styles = read_styles(COMMUNITY.as_bytes()).unwrap();
+        let listed = serde_json::from_str::<Vec<serde_json::Value>>(COMMUNITY).unwrap();
+        assert_eq!(styles.len(), listed.len(), "every community style is valid");
+        let first = &styles[0];
+        let settings = style_settings(&first.appearance);
+        let shadow = settings
+            .iter()
+            .find(|(label, _)| label == "Shadow")
+            .unwrap();
+        assert_eq!(shadow.1, first.appearance.shadow.to_string());
     }
 
     #[test]
@@ -4340,21 +4519,9 @@ mod tests {
         look.button_position = ButtonPosition::Top;
         look.button_alignment = ButtonAlignment::Center;
         // What the form returns before anything is touched; see ui::form_values.
-        let values: Vec<String> = group_fields(&group)
+        let values: Vec<String> = group_fields(&group, Vec::new())
             .iter()
-            .filter_map(|field| match field {
-                ui::Field::Text { value, .. } | ui::Field::Color { value, .. } => {
-                    Some(value.clone())
-                }
-                ui::Field::Check { value, .. } => Some(value.to_string()),
-                ui::Field::Choice { selected, .. } => Some(selected.to_string()),
-                ui::Field::Preset {
-                    measurements,
-                    selected,
-                    ..
-                } => Some(measurements[*selected].to_string()),
-                ui::Field::Page { .. } | ui::Field::Style { .. } => None,
-            })
+            .filter_map(ui::Field::value)
             .collect();
         let mut edited = Group::default();
         apply_group_values(&mut edited, &values).unwrap();

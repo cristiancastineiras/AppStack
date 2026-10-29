@@ -175,7 +175,13 @@ pub fn select_files(owner: HWND, folder: bool, multiple: bool) -> Result<Vec<Pat
     }
 }
 
-pub fn save_file(owner: HWND, name: &str) -> Result<Option<PathBuf>, String> {
+/// Asks where to save a file; `kind` is its type's name and extension, like ("AppStack
+/// backup", "agz").
+pub fn save_file(
+    owner: HWND,
+    name: &str,
+    (kind, extension): (&str, &str),
+) -> Result<Option<PathBuf>, String> {
     unsafe {
         let dialog: IFileSaveDialog =
             CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).map_err(failure)?;
@@ -185,10 +191,13 @@ pub fn save_file(owner: HWND, name: &str) -> Result<Option<PathBuf>, String> {
         dialog
             .SetFileName(PCWSTR(wide(name).as_ptr()))
             .map_err(failure)?;
-        dialog.SetDefaultExtension(w!("agz")).map_err(failure)?;
+        dialog
+            .SetDefaultExtension(PCWSTR(wide(extension).as_ptr()))
+            .map_err(failure)?;
+        let (kind, spec) = (wide(kind), wide(format!("*.{extension}")));
         let filters = [COMDLG_FILTERSPEC {
-            pszName: w!("AppStack backup"),
-            pszSpec: w!("*.agz"),
+            pszName: PCWSTR(kind.as_ptr()),
+            pszSpec: PCWSTR(spec.as_ptr()),
         }];
         dialog.SetFileTypes(&filters).map_err(failure)?;
         if let Err(error) = dialog.Show(Some(owner)) {

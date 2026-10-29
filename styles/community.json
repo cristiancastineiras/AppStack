@@ -1,0 +1,64 @@
+[
+  {
+    "name": "Ocean",
+    "author": "AppStack",
+    "appearance": {
+      "columns": 4, "icon_size": 48, "card_layout": true,
+      "gap_horizontal": 8, "gap_vertical": 8, "padding_horizontal": 16, "padding_vertical": 16,
+      "corner_radius": 24, "tile_radius": 9999,
+      "accent": "#0EA5E9", "border_width": 1, "border_color": "#38BDF8", "shadow": 4
+    }
+  },
+  {
+    "name": "Forest",
+    "author": "AppStack",
+    "appearance": {
+      "columns": 4, "icon_size": 32, "card_layout": true, "label_size": 14,
+      "gap_horizontal": 4, "gap_vertical": 4, "padding_horizontal": 12, "padding_vertical": 12,
+      "corner_radius": 16, "tile_radius": 12,
+      "accent": "#16A34A", "border_width": 2, "border_color": "#22C55E", "shadow": 3
+    }
+  },
+  {
+    "name": "Rose pill",
+    "author": "AppStack",
+    "appearance": {
+      "columns": 6, "icon_size": 32, "show_labels": false, "show_header": false,
+      "show_edit_button": false, "show_launch_all_button": false,
+      "gap_horizontal": 8, "gap_vertical": 8, "padding_horizontal": 12, "padding_vertical": 8,
+      "corner_radius": 9999, "tile_radius": 9999,
+      "accent": "#F43F5E", "border_width": 1, "border_color": "#FB7185", "shadow": 4
+    }
+  },
+  {
+    "name": "Terminal",
+    "author": "AppStack",
+    "appearance": {
+      "columns": 1, "icon_size": 20, "label_position": "Right", "label_size": 14,
+      "gap_horizontal": 0, "gap_vertical": 0, "padding_horizontal": 8, "padding_vertical": 8,
+      "corner_radius": 0, "tile_radius": 0, "button_position": "Top", "button_alignment": "Right",
+      "scroll": true, "visible_rows": 8,
+      "accent": "", "border_width": 2, "border_color": "#525252", "shadow": 0
+    }
+  },
+  {
+    "name": "Lavender launchpad",
+    "author": "AppStack",
+    "appearance": {
+      "columns": 5, "icon_size": 64, "card_layout": false, "label_size": 14,
+      "gap_horizontal": 12, "gap_vertical": 12, "padding_horizontal": 24, "padding_vertical": 24,
+      "corner_radius": 32, "tile_radius": 16, "button_alignment": "Center",
+      "accent": "#8B5CF6", "border_width": 0, "border_color": "", "shadow": 5
+    }
+  },
+  {
+    "name": "Amber compact",
+    "author": "AppStack",
+    "appearance": {
+      "columns": 6, "icon_size": 24, "show_labels": false, "show_header": true,
+      "gap_horizontal": 4, "gap_vertical": 4, "padding_horizontal": 8, "padding_vertical": 8,
+      "corner_radius": 12, "tile_radius": 8, "scroll": true, "visible_rows": 2,
+      "accent": "#F59E0B", "border_width": 1, "border_color": "#FBBF24", "shadow": 2
+    }
+  }
+]

@@ -1,7 +1,9 @@
 //! Updates from the project's GitHub releases. Installed copies run the new installer;
-//! any other copy (the portable executable) swaps its own file and restarts.
+//! any other copy (the portable executable) swaps its own file and restarts. Community popup
+//! styles come from the same repository.
 
 use super::shell::{failure, wide};
+use appstack::model::read_styles;
 use serde::Deserialize;
 use std::{
     ffi::c_void,
@@ -127,6 +129,22 @@ pub fn prepare(release: &Release, data_dir: &Path) -> Result<Command, String> {
     let mut command = Command::new(executable);
     command.arg("--data-dir").arg(data_dir);
     Ok(command)
+}
+
+/// Data folder file holding the latest community styles, read when the group editor opens.
+pub const COMMUNITY_STYLES: &str = "community-styles.json";
+
+/// Downloads the repository's community styles into the data folder, keeping the previous
+/// copy unless the new one holds valid styles.
+pub fn community_styles(root: &Path) -> Result<(), String> {
+    let bytes = get(
+        &format!("https://raw.githubusercontent.com/{REPOSITORY}/main/styles/community.json"),
+        1 << 20,
+    )?;
+    read_styles(&bytes)?;
+    let staged = root.join(format!("{COMMUNITY_STYLES}.tmp"));
+    std::fs::write(&staged, &bytes).map_err(failure)?;
+    std::fs::rename(&staged, root.join(COMMUNITY_STYLES)).map_err(failure)
 }
 
 /// Removes the executable a previous portable update left behind.

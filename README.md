@@ -29,7 +29,8 @@ automatically** turns the automatic check off. Installed copies update by runnin
 the new installer silently; the portable executable replaces its own file. Either
 way AppStack restarts on the new version with your groups untouched. The updater
 only downloads over HTTPS from this repository's releases and checks the
-download's size.
+download's size. The same setting refreshes the community popup styles from this
+repository.
 
 ## Build And Run
 
@@ -117,7 +118,19 @@ after rebuilding; Explorer may retain its own icon cache until it refreshes.
   Sizes follow monitor DPI and the popup remains constrained to the work area.
 - **Popup style** at the top of the Style tab fills in every look setting, on all
   tabs, with a ready-made look (Dock, Bubble, List, Cards, Launchpad, Minimal,
-  Indigo or Sunset), which can then be adjusted before **Save**.
+  Indigo or Sunset), one of your saved styles or a community style, and the live
+  preview shows it at once; it can then be adjusted before **Save**.
+- **Group > Save popup style** keeps the selected group's look under a name (and
+  optional author) for any group to use; **Share popup style as a file** writes it
+  as a small `.json` file to send to someone, who adds it with **Import popup
+  style**; **Delete saved style** removes one. Saved styles live in
+  `appstack.json`, so backups carry them. A group's icon path is never included.
+- **Community styles** come from [`styles/community.json`](styles/community.json)
+  in this repository. Each build includes the list as it was then; with **Check for
+  updates automatically** on, AppStack also downloads the current list at start-up
+  and once a day, so styles added later appear without updating AppStack. Every
+  style is validated before use; invalid ones are skipped. To publish yours, see
+  [CONTRIBUTING.md](CONTRIBUTING.md#sharing-a-community-style).
 - A live preview beside the settings shows the group's labels, icons, spacing,
   actions and rounding as controls change. Icons load asynchronously using the
   existing workers. Preview changes are not persisted until **Save**; **Cancel**

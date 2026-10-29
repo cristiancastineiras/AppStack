@@ -38,3 +38,7 @@ The updater only talks to GitHub over HTTPS, only downloads assets from this
 repository's releases, and checks that the downloaded size matches what GitHub
 reports. The executables are not code-signed yet, so Windows SmartScreen may
 warn the first time you run a new download.
+
+Community styles are downloaded from this repository the same way. They are plain
+popup settings, validated like your own before use (sizes in range, colors as
+`#RRGGBB`, short names); they cannot run anything or reference files.

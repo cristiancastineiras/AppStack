@@ -268,6 +268,49 @@ impl Appearance {
         )
     }
 
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=16).contains(&self.columns) {
+            return Err("Columns must be between 1 and 16".into());
+        }
+        if !(8..=24).contains(&self.label_size) {
+            return Err("Label size must be between 8 and 24".into());
+        }
+        if !(1..=50).contains(&self.visible_rows) {
+            return Err("Visible rows must be between 1 and 50".into());
+        }
+        if self.minimum_width > 2000 {
+            return Err("Minimum popup width must be between 0 and 2000".into());
+        }
+        if !(16..=128).contains(&self.icon_size) {
+            return Err("Icon size must be between 16 and 128".into());
+        }
+        if self.padding_horizontal > 100 || self.padding_vertical > 100 {
+            return Err("Popup padding must be between 0 and 100".into());
+        }
+        if self.gap_horizontal > 100 || self.gap_vertical > 100 {
+            return Err("Application spacing must be between 0 and 100".into());
+        }
+        if (self.corner_radius > 48 && self.corner_radius != ROUNDED_FULL)
+            || (self.tile_radius > 32 && self.tile_radius != ROUNDED_FULL)
+        {
+            return Err("Popup corners must be 0-48 and tile corners 0-32".into());
+        }
+        if self.border_width > 8 || self.shadow > 5 {
+            return Err("Border width must be 0-8 and shadow 0-5".into());
+        }
+        for (name, color) in [
+            ("Accent", &self.accent),
+            ("Border color", &self.border_color),
+        ] {
+            if !color.is_empty() && parse_color(color).is_none() {
+                return Err(format!(
+                    "{name} must be a hexadecimal color, for example #16856B"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Rows the popup shows before scrolling; the caller still caps it to the screen.
     pub fn visible_rows(&self, rows: usize) -> usize {
         if self.scroll {
@@ -347,6 +390,8 @@ pub struct Config {
     pub schema_version: u32,
     pub groups: Vec<Group>,
     pub settings: Settings,
+    /// Popup looks the user saved; versions without styles ignore the field.
+    pub styles: Vec<Style>,
 }
 
 impl Default for Config {
@@ -355,11 +400,66 @@ impl Default for Config {
             schema_version: 2,
             groups: Vec::new(),
             settings: Settings::default(),
+            styles: Vec::new(),
         }
     }
 }
 
+const MAX_STYLES: usize = 200;
+
+/// A named popup look that can be saved, shared as a file and listed as a community style.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Style {
+    pub name: String,
+    pub author: String,
+    pub appearance: Appearance,
+}
+
+impl Style {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, text) in [("name", &self.name), ("author", &self.author)] {
+            if text.chars().count() > 60 || text.chars().any(char::is_control) {
+                return Err(format!(
+                    "A style {field} must be at most 60 plain characters"
+                ));
+            }
+        }
+        if self.name.trim().is_empty() {
+            return Err("A style needs a name".into());
+        }
+        self.appearance.validate()
+    }
+}
+
+/// Styles from a shared file: one style, or a list like the repository's community file.
+/// Invalid styles are skipped so one bad entry does not hide the rest.
+pub fn read_styles(bytes: &[u8]) -> Result<Vec<Style>, String> {
+    let styles = serde_json::from_slice::<Vec<Style>>(bytes)
+        .or_else(|_| serde_json::from_slice::<Style>(bytes).map(|style| vec![style]))
+        .map_err(|_| "This file is not an AppStack style".to_string())?;
+    let valid: Vec<_> = styles
+        .into_iter()
+        .filter(|style| style.validate().is_ok())
+        .take(MAX_STYLES)
+        .collect();
+    if valid.is_empty() {
+        return Err("This file has no valid AppStack style".into());
+    }
+    Ok(valid)
+}
+
 impl Config {
+    /// Adds a style, replacing a saved one with the same name.
+    pub fn keep_style(&mut self, mut style: Style) {
+        style.name = style.name.trim().into();
+        // A group's own icon path is personal and plays no part in the look.
+        style.appearance.icon.clear();
+        self.styles
+            .retain(|saved| !saved.name.eq_ignore_ascii_case(&style.name));
+        self.styles.push(style);
+    }
+
     pub fn group(&self, id: &str) -> Option<&Group> {
         self.groups.iter().find(|group| group.id == id)
     }
@@ -381,6 +481,12 @@ impl Config {
         }
         if self.groups.len() > 10_000 {
             return Err("A configuration can contain at most 10,000 groups".into());
+        }
+        if self.styles.len() > MAX_STYLES {
+            return Err(format!("At most {MAX_STYLES} styles can be saved"));
+        }
+        for style in &self.styles {
+            style.validate()?;
         }
         for font in [&self.settings.title_font, &self.settings.label_font] {
             // Windows font face names hold at most 31 UTF-16 units.
@@ -405,46 +511,7 @@ impl Config {
             if group.entries.len() > 10_000 {
                 return Err("A group can contain at most 10,000 applications".into());
             }
-            if !(1..=16).contains(&group.appearance.columns) {
-                return Err("Columns must be between 1 and 16".into());
-            }
-            if !(8..=24).contains(&group.appearance.label_size) {
-                return Err("Label size must be between 8 and 24".into());
-            }
-            if !(1..=50).contains(&group.appearance.visible_rows) {
-                return Err("Visible rows must be between 1 and 50".into());
-            }
-            let appearance = &group.appearance;
-            if appearance.minimum_width > 2000 {
-                return Err("Minimum popup width must be between 0 and 2000".into());
-            }
-            if !(16..=128).contains(&appearance.icon_size) {
-                return Err("Icon size must be between 16 and 128".into());
-            }
-            if appearance.padding_horizontal > 100 || appearance.padding_vertical > 100 {
-                return Err("Popup padding must be between 0 and 100".into());
-            }
-            if appearance.gap_horizontal > 100 || appearance.gap_vertical > 100 {
-                return Err("Application spacing must be between 0 and 100".into());
-            }
-            if (appearance.corner_radius > 48 && appearance.corner_radius != ROUNDED_FULL)
-                || (appearance.tile_radius > 32 && appearance.tile_radius != ROUNDED_FULL)
-            {
-                return Err("Popup corners must be 0-48 and tile corners 0-32".into());
-            }
-            if appearance.border_width > 8 || appearance.shadow > 5 {
-                return Err("Border width must be 0-8 and shadow 0-5".into());
-            }
-            for (name, color) in [
-                ("Accent", &appearance.accent),
-                ("Border color", &appearance.border_color),
-            ] {
-                if !color.is_empty() && parse_color(color).is_none() {
-                    return Err(format!(
-                        "{name} must be a hexadecimal color, for example #16856B"
-                    ));
-                }
-            }
+            group.appearance.validate()?;
             for entry in &group.entries {
                 if uuid::Uuid::parse_str(&entry.id).is_err() || !entry_ids.insert(entry.id.as_str())
                 {
@@ -997,5 +1064,44 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn shared_styles_are_validated_and_saved_by_name() {
+        assert!(read_styles(b"not json").is_err());
+        let file = br##"[
+            {"name": "Ocean", "author": "me", "appearance": {"shadow": 4, "accent": "#0EA5E9"}},
+            {"name": "Broken", "appearance": {"shadow": 99}},
+            {"name": "", "appearance": {}}
+        ]"##;
+        let styles = read_styles(file).unwrap();
+        assert_eq!(styles.len(), 1, "invalid entries are skipped, not fatal");
+        assert_eq!(styles[0].appearance.shadow, 4);
+        assert_eq!(read_styles(br#"{"name": "Solo"}"#).unwrap()[0].name, "Solo");
+        assert!(
+            read_styles(br#"[{"name": "Bad", "appearance": {"border_color": "red"}}]"#).is_err()
+        );
+
+        let mut config = Config::default();
+        let mut look = styles[0].clone();
+        look.appearance.icon = r"C:\Users\me\private.ico".into();
+        config.keep_style(look.clone());
+        look.name = " ocean ".into();
+        look.appearance.shadow = 1;
+        config.keep_style(look);
+        assert_eq!(
+            config.styles.len(),
+            1,
+            "the same name replaces the saved style"
+        );
+        assert_eq!(config.styles[0].name, "ocean");
+        assert_eq!(config.styles[0].appearance.shadow, 1);
+        assert!(
+            config.styles[0].appearance.icon.is_empty(),
+            "no personal paths are shared"
+        );
+        config.validate().unwrap();
+        config.styles[0].appearance.columns = 0;
+        assert!(config.validate().is_err());
     }
 }
