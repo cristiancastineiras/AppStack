@@ -33,6 +33,9 @@ use windows::{
     core::{BOOL, PCWSTR, w},
 };
 
+const OPEN_MANAGER: u16 = 1;
+/// Tray menu entries that open a group's popup: this plus the group's position.
+const TRAY_GROUPS: u16 = 1000;
 const NEW_GROUP: u16 = 101;
 const EDIT_GROUP: u16 = 102;
 const DUPLICATE_GROUP: u16 = 103;
@@ -115,7 +118,46 @@ impl Drop for Images {
     }
 }
 
-fn show_popup(window: HWND, focus: HWND, animate: bool) -> Result<(), String> {
+/// Stages of opening a popup for APPSTACK_STARTUP_TRACE, in `ui::epoch_us`, appended as one JSON
+/// line per opening to `<trace>.popups.jsonl`; mod.rs writes the forwarding side beside it.
+struct Trace {
+    path: Option<std::path::PathBuf>,
+    stages: Vec<(&'static str, u128)>,
+}
+
+impl Trace {
+    fn new() -> Self {
+        let path = std::env::var_os("APPSTACK_STARTUP_TRACE").map(std::path::PathBuf::from);
+        let mut stages = Vec::new();
+        if path.is_some() {
+            stages.push(("received", ui::received_us()));
+            stages.push(("request", ui::epoch_us()));
+        }
+        Self { path, stages }
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        if self.path.is_some() {
+            self.stages.push((name, ui::epoch_us()));
+        }
+    }
+
+    fn write(self, route: &str) {
+        use std::io::Write;
+        if let Some(path) = self.path {
+            let line = serde_json::json!({ "route": route, "stages_us": self.stages });
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path.with_extension("popups.jsonl"))
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+    }
+}
+
+fn show_popup(window: HWND, focus: HWND, animate: bool, trace: &mut Trace) -> Result<(), String> {
     unsafe {
         let _ = RemovePropW(window, w!("AppStack.PopupReady"));
         if animate {
@@ -125,9 +167,12 @@ fn show_popup(window: HWND, focus: HWND, animate: bool) -> Result<(), String> {
             let _ = SetLayeredWindowAttributes(window, COLORREF(0), 255, LWA_ALPHA);
         }
         let _ = ShowWindow(window, SW_SHOWNORMAL);
+        trace.mark("shown");
         let _ = RedrawWindow(Some(window), None, None, RDW_ALLCHILDREN | RDW_UPDATENOW);
+        trace.mark("painted");
         let _ = SetForegroundWindow(window);
         let _ = SetFocus(Some(focus));
+        trace.mark("focused");
         SetPropW(
             window,
             w!("AppStack.PopupReady"),
@@ -135,6 +180,7 @@ fn show_popup(window: HWND, focus: HWND, animate: bool) -> Result<(), String> {
         )
         .map_err(failure)?;
         NotifyWinEvent(EVENT_OBJECT_STATECHANGE, window, 0, 0);
+        trace.mark("ready");
     }
     Ok(())
 }
@@ -357,63 +403,235 @@ fn popup_styles() -> Vec<(String, Vec<(String, String)>)> {
         .collect()
 }
 
+const TITLE_FONT_FIELD: &str = "Folder title font";
+const LABEL_FONT_FIELD: &str = "Icon label font";
+
+/// Title and label font pairs for Preferences, from the embedded fonts and families Windows
+/// installs. A pair is offered only when both families are in `fonts`, the font selects'
+/// choices, and it fills them with their indices.
+fn font_themes(fonts: &[String]) -> Vec<(String, Vec<(String, String)>)> {
+    const THEMES: &[(&str, &str, &str)] = &[
+        ("AppStack (Space Grotesk, Inter)", TITLE_FONT, LABEL_FONT),
+        (
+            "Windows 11 (Segoe UI Variable)",
+            "Segoe UI Variable Display",
+            "Segoe UI Variable Text",
+        ),
+        ("Windows classic (Segoe UI)", "Segoe UI", "Segoe UI"),
+        ("Modern (Bahnschrift, Segoe UI)", "Bahnschrift", "Segoe UI"),
+        ("Office (Cambria, Calibri)", "Cambria", "Calibri"),
+        ("Humanist (Candara, Corbel)", "Candara", "Corbel"),
+        ("Editorial (Georgia, Verdana)", "Georgia", "Verdana"),
+        (
+            "Book (Sitka Heading, Sitka Text)",
+            "Sitka Heading",
+            "Sitka Text",
+        ),
+        ("Friendly (Trebuchet MS, Tahoma)", "Trebuchet MS", "Tahoma"),
+        (
+            "Developer (Cascadia Code, Segoe UI)",
+            "Cascadia Code",
+            "Segoe UI",
+        ),
+        ("Typewriter (Consolas)", "Consolas", "Consolas"),
+    ];
+    let index = |family: &str| fonts.iter().position(|font| font == family);
+    std::iter::once(("Choose a font theme…".to_string(), Vec::new()))
+        .chain(THEMES.iter().filter_map(|(name, title, label)| {
+            let (title, label) = (index(title)?, index(label)?);
+            Some((
+                name.to_string(),
+                vec![
+                    (TITLE_FONT_FIELD.into(), title.to_string()),
+                    (LABEL_FONT_FIELD.into(), label.to_string()),
+                ],
+            ))
+        }))
+        .collect()
+}
+
+/// The group editor's fields. Two columns per tab, filled row by row: keep related settings in
+/// pairs, and keep apply_group_values' indices in this order.
+fn group_fields(group: &Group) -> Vec<Field> {
+    let appearance = &group.appearance;
+    vec![
+        Field::page("General"),
+        Field::text("Name", &group.name),
+        Field::choice(
+            "Application order",
+            &["Manual", "Alphabetical"],
+            usize::from(appearance.sort == SortMode::Alphabetical),
+        ),
+        Field::choice(
+            "Group icon",
+            &["Single", "Grid", "Mosaic"],
+            usize::from(appearance.grid_icon) * (1 + usize::from(appearance.mosaic_icon)),
+        ),
+        Field::text("Icon path (.ico, .png, .exe)", &appearance.icon),
+        Field::check(
+            "Show this group in the system tray",
+            appearance.show_on_tray,
+        ),
+        Field::page("Style"),
+        Field::style("Popup style", popup_styles()),
+        Field::choice(
+            "Layout",
+            &["Compact", "Card"],
+            usize::from(appearance.card_layout),
+        ),
+        Field::preset("Popup rounding", ROUNDING_PRESETS, appearance.corner_radius),
+        Field::preset("Tile rounding", ROUNDING_PRESETS, appearance.tile_radius),
+        Field::preset("Border width", BORDER_PRESETS, appearance.border_width),
+        Field::color("Border color (optional)", &appearance.border_color),
+        Field::color("Accent color (optional)", &appearance.accent),
+        Field::preset("Shadow", SHADOW_PRESETS, appearance.shadow),
+        Field::page("Layout"),
+        Field::preset(
+            "Columns",
+            &[
+                ("1", 1),
+                ("2", 2),
+                ("3", 3),
+                ("4", 4),
+                ("5", 5),
+                ("6", 6),
+                ("7", 7),
+                ("8", 8),
+                ("9", 9),
+                ("10", 10),
+                ("11", 11),
+                ("12", 12),
+                ("13", 13),
+                ("14", 14),
+                ("15", 15),
+                ("16", 16),
+            ],
+            appearance.columns as u32,
+        ),
+        Field::preset("Minimum width", WIDTH_PRESETS, appearance.minimum_width),
+        Field::preset("Horizontal gap", SPACING_PRESETS, appearance.gap_horizontal),
+        Field::preset("Vertical gap", SPACING_PRESETS, appearance.gap_vertical),
+        Field::preset(
+            "Side padding",
+            SPACING_PRESETS,
+            appearance.padding_horizontal,
+        ),
+        Field::preset(
+            "Vertical padding",
+            SPACING_PRESETS,
+            appearance.padding_vertical,
+        ),
+        Field::check("Scroll inside the group", appearance.scroll).enabling(&["Visible rows"]),
+        Field::preset(
+            "Visible rows",
+            &[
+                ("1", 1),
+                ("2", 2),
+                ("3", 3),
+                ("4", 4),
+                ("5", 5),
+                ("6", 6),
+                ("8", 8),
+                ("12", 12),
+                ("16", 16),
+            ],
+            appearance.visible_rows,
+        ),
+        Field::page("Icons and labels"),
+        Field::preset("Icon size", ICON_PRESETS, appearance.icon_size),
+        Field::check("Show icon labels", appearance.show_labels)
+            .enabling(&["Labels", "Label size"]),
+        Field::choice(
+            "Labels",
+            &["Bottom", "Right"],
+            usize::from(appearance.label_position == LabelPosition::Right),
+        ),
+        Field::preset("Label size", LABEL_PRESETS, appearance.label_size),
+        Field::page("Header and buttons"),
+        Field::check("Show group header", appearance.show_header).enabling(&["Header"]),
+        Field::choice(
+            "Header",
+            &["Top", "Bottom"],
+            usize::from(appearance.header_bottom),
+        ),
+        Field::check("Show Edit button", appearance.show_edit_button)
+            .enabling(&["Buttons", "Button alignment"]),
+        Field::check("Show Launch all button", appearance.show_launch_all_button)
+            .enabling(&["Buttons", "Button alignment"]),
+        Field::choice(
+            "Buttons",
+            &["Bottom", "Top"],
+            usize::from(appearance.button_position == ButtonPosition::Top),
+        ),
+        Field::choice(
+            "Button alignment",
+            &["Left", "Center", "Right"],
+            match appearance.button_alignment {
+                ButtonAlignment::Left => 0,
+                ButtonAlignment::Center => 1,
+                ButtonAlignment::Right => 2,
+            },
+        ),
+    ]
+}
+
 fn apply_group_values(group: &mut Group, values: &[String]) -> Result<(), String> {
     if values.len() != 30 {
         return Err("The group settings are incomplete".into());
     }
     group.name = values[0].trim().into();
     let appearance = &mut group.appearance;
-    appearance.icon = values[1].trim().into();
-    appearance.grid_icon = values[2] != "0";
-    appearance.mosaic_icon = values[2] == "2";
-    appearance.sort = if values[3] == "1" {
+    appearance.sort = if values[1] == "1" {
         SortMode::Alphabetical
     } else {
         SortMode::Manual
     };
+    appearance.grid_icon = values[2] != "0";
+    appearance.mosaic_icon = values[2] == "2";
+    appearance.icon = values[3].trim().into();
     appearance.show_on_tray = values[4] == "true";
     let number = |index: usize| {
         values[index]
             .parse::<u32>()
             .map_err(|_| "Choose a valid size".to_string())
     };
-    appearance.columns = number(5)? as usize;
-    appearance.icon_size = number(6)?;
-    appearance.gap_horizontal = number(7)?;
-    appearance.gap_vertical = number(8)?;
-    appearance.padding_horizontal = number(9)?;
-    appearance.padding_vertical = number(10)?;
-    appearance.corner_radius = number(11)?;
-    appearance.tile_radius = number(12)?;
-    appearance.card_layout = values[13] == "1";
-    appearance.accent = values[14].trim().into();
-    appearance.show_labels = values[15] == "true";
-    appearance.label_position = if values[16] == "1" {
+    appearance.card_layout = values[5] == "1";
+    appearance.corner_radius = number(6)?;
+    appearance.tile_radius = number(7)?;
+    appearance.border_width = number(8)?;
+    appearance.border_color = values[9].trim().into();
+    appearance.accent = values[10].trim().into();
+    appearance.shadow = number(11)?;
+    appearance.columns = number(12)? as usize;
+    appearance.minimum_width = number(13)?;
+    appearance.gap_horizontal = number(14)?;
+    appearance.gap_vertical = number(15)?;
+    appearance.padding_horizontal = number(16)?;
+    appearance.padding_vertical = number(17)?;
+    appearance.scroll = values[18] == "true";
+    appearance.visible_rows = number(19)?;
+    appearance.icon_size = number(20)?;
+    appearance.show_labels = values[21] == "true";
+    appearance.label_position = if values[22] == "1" {
         LabelPosition::Right
     } else {
         LabelPosition::Bottom
     };
-    appearance.label_size = number(17)?;
-    appearance.show_header = values[18] == "true";
-    appearance.header_bottom = values[19] == "1";
-    appearance.show_edit_button = values[20] == "true";
-    appearance.show_launch_all_button = values[21] == "true";
-    appearance.button_position = if values[22] == "1" {
+    appearance.label_size = number(23)?;
+    appearance.show_header = values[24] == "true";
+    appearance.header_bottom = values[25] == "1";
+    appearance.show_edit_button = values[26] == "true";
+    appearance.show_launch_all_button = values[27] == "true";
+    appearance.button_position = if values[28] == "1" {
         ButtonPosition::Top
     } else {
         ButtonPosition::Bottom
     };
-    appearance.button_alignment = match values[23].as_str() {
+    appearance.button_alignment = match values[29].as_str() {
         "0" => ButtonAlignment::Left,
         "1" => ButtonAlignment::Center,
         _ => ButtonAlignment::Right,
     };
-    appearance.scroll = values[24] == "true";
-    appearance.visible_rows = number(25)?;
-    appearance.minimum_width = number(26)?;
-    appearance.border_width = number(27)?;
-    appearance.border_color = values[28].trim().into();
-    appearance.shadow = number(29)?;
     Ok(())
 }
 
@@ -459,7 +677,7 @@ struct Popup {
     group_id: String,
     entries: Vec<Entry>,
     slots: Vec<Slot>,
-    fonts: [Font; 4],
+    fonts: [Font; 3],
     look: ui::Look,
     dpi: u32,
     columns: usize,
@@ -521,9 +739,6 @@ impl Drop for Popup {
     fn drop(&mut self) {
         ui::forget_list(self.list);
         ui::set_pager(self.viewport, None, 0, 0);
-        if let Some(back) = self.back {
-            ui::forget_ghost(back);
-        }
         unsafe {
             if self.drop_target.is_some() {
                 let _ = RevokeDragDrop(self.window);
@@ -629,9 +844,10 @@ impl Application {
             .map(|group| group.id.clone())
             .collect();
         for id in groups {
-            if let Some(anchor) = self.taskbar_point(&id, point) {
-                self.build_popup(&id, anchor, None, false, false)?;
-            }
+            // Unpinned groups are prepared too: reuse moves the popup to wherever it opens on
+            // this monitor, and the taskbar lookup only warms the anchor of pinned ones.
+            let anchor = self.taskbar_point(&id, point).unwrap_or(point);
+            self.build_popup(&id, anchor, None, false, false)?;
         }
         Ok(())
     }
@@ -839,10 +1055,11 @@ impl Application {
                 (ADD_FILES, "Add apps"),
                 (ADD_SUBGROUP, "Add subgroup"),
             ] {
-                buttons.push((
-                    id,
-                    ui::child(window, w!("BUTTON"), label, id, WS_TABSTOP, &font)?,
-                ));
+                let button = ui::child(window, w!("BUTTON"), label, id, WS_TABSTOP, &font)?;
+                if let Some(icon) = command_icon(id) {
+                    ui::button_icon(button, icon);
+                }
+                buttons.push((id, button));
             }
             let group_images = Images::new(ui::scale(24, dpi));
             let entry_images = Images::new(ui::scale(24, dpi));
@@ -1004,16 +1221,12 @@ impl Application {
                 sidebar,
                 ui::scale(30, dpi),
             );
-            for (index, (_, button)) in manager.buttons.iter().enumerate() {
-                let widths = [110, 75, 100, 120];
-                let left: i32 = widths[..index].iter().sum();
-                ui::place(
-                    *button,
-                    sidebar + margin * 2 + ui::scale(left, dpi),
-                    margin - 2,
-                    ui::scale(widths[index] - 8, dpi),
-                    ui::scale(30, dpi),
-                );
+            let mut left = sidebar + margin * 2;
+            for (_, button) in &manager.buttons {
+                // The label plus room for its icon and the button's padding.
+                let width = ui::text_width(&manager.font, &ui::text(*button)) + ui::scale(52, dpi);
+                ui::place(*button, left, margin - 2, width, ui::scale(30, dpi));
+                left += width + ui::scale(8, dpi);
             }
             let height = bounds.bottom - toolbar - margin - ui::scale(26, dpi);
             ui::place(manager.groups, margin, toolbar, sidebar, height);
@@ -1204,120 +1417,7 @@ impl Application {
         } else {
             self.selected_group().ok_or("No group selected")?.clone()
         };
-        let appearance = &group.appearance;
-        let fields = [
-            Field::page("General"),
-            Field::text("Name", &group.name),
-            Field::text("Icon path (.ico, .png, .exe)", &appearance.icon),
-            Field::choice(
-                "Group icon",
-                &["Single", "Grid", "Mosaic"],
-                usize::from(appearance.grid_icon) * (1 + usize::from(appearance.mosaic_icon)),
-            ),
-            Field::choice(
-                "Application order",
-                &["Manual", "Alphabetical"],
-                usize::from(appearance.sort == SortMode::Alphabetical),
-            ),
-            Field::check(
-                "Show this group in the system tray",
-                appearance.show_on_tray,
-            ),
-            Field::page("Interface"),
-            Field::style("Popup style", popup_styles()),
-            Field::preset(
-                "Columns",
-                &[
-                    ("1", 1),
-                    ("2", 2),
-                    ("3", 3),
-                    ("4", 4),
-                    ("5", 5),
-                    ("6", 6),
-                    ("7", 7),
-                    ("8", 8),
-                    ("9", 9),
-                    ("10", 10),
-                    ("11", 11),
-                    ("12", 12),
-                    ("13", 13),
-                    ("14", 14),
-                    ("15", 15),
-                    ("16", 16),
-                ],
-                appearance.columns as u32,
-            ),
-            Field::preset("Icon size", ICON_PRESETS, appearance.icon_size),
-            Field::preset("Horizontal gap", SPACING_PRESETS, appearance.gap_horizontal),
-            Field::preset("Vertical gap", SPACING_PRESETS, appearance.gap_vertical),
-            Field::preset(
-                "Side padding",
-                SPACING_PRESETS,
-                appearance.padding_horizontal,
-            ),
-            Field::preset(
-                "Vertical padding",
-                SPACING_PRESETS,
-                appearance.padding_vertical,
-            ),
-            Field::preset("Popup rounding", ROUNDING_PRESETS, appearance.corner_radius),
-            Field::preset("Tile rounding", ROUNDING_PRESETS, appearance.tile_radius),
-            Field::choice(
-                "Layout",
-                &["Compact", "Card"],
-                usize::from(appearance.card_layout),
-            ),
-            Field::color("Accent color (optional)", &appearance.accent),
-            Field::check("Show icon labels", appearance.show_labels),
-            Field::choice(
-                "Labels",
-                &["Bottom", "Right"],
-                usize::from(appearance.label_position == LabelPosition::Right),
-            ),
-            Field::preset("Label size", LABEL_PRESETS, appearance.label_size),
-            Field::check("Show group header", appearance.show_header),
-            Field::choice(
-                "Header",
-                &["Top", "Bottom"],
-                usize::from(appearance.header_bottom),
-            ),
-            Field::check("Show Edit button", appearance.show_edit_button),
-            Field::check("Show Launch all button", appearance.show_launch_all_button),
-            Field::choice(
-                "Buttons",
-                &["Bottom", "Top"],
-                usize::from(appearance.button_position == ButtonPosition::Top),
-            ),
-            Field::choice(
-                "Button alignment",
-                &["Left", "Center", "Right"],
-                match appearance.button_alignment {
-                    ButtonAlignment::Left => 0,
-                    ButtonAlignment::Center => 1,
-                    ButtonAlignment::Right => 2,
-                },
-            ),
-            Field::check("Scroll inside the group", appearance.scroll),
-            Field::preset(
-                "Visible rows",
-                &[
-                    ("1", 1),
-                    ("2", 2),
-                    ("3", 3),
-                    ("4", 4),
-                    ("5", 5),
-                    ("6", 6),
-                    ("8", 8),
-                    ("12", 12),
-                    ("16", 16),
-                ],
-                appearance.visible_rows,
-            ),
-            Field::preset("Minimum width", WIDTH_PRESETS, appearance.minimum_width),
-            Field::preset("Border width", BORDER_PRESETS, appearance.border_width),
-            Field::color("Border color (optional)", &appearance.border_color),
-            Field::preset("Shadow", SHADOW_PRESETS, appearance.shadow),
-        ];
+        let fields = group_fields(&group);
         let mut preview_icons = Vec::new();
         let mut requested_icons = Vec::new();
         let mut loaded_icons = HashSet::new();
@@ -1506,37 +1606,6 @@ impl Application {
             Theme::Light => 1,
             Theme::Dark => 2,
         };
-        let fields = [
-            Field::choice(
-                "Manager theme",
-                &["System", "Light", "Dark"],
-                theme_index(settings.main_theme),
-            ),
-            Field::choice(
-                "Popup theme",
-                &["System", "Light", "Dark"],
-                theme_index(settings.popup_theme),
-            ),
-            Field::choice(
-                "Group order",
-                &["Manual", "Alphabetical"],
-                usize::from(settings.group_sort == SortMode::Alphabetical),
-            ),
-            Field::check("Start with Windows", settings.start_with_windows),
-            Field::check("Show AppStack in the system tray", settings.show_tray),
-            Field::check("Enable Launch all", settings.launch_all_enabled),
-            Field::check(
-                "Grayscale group shortcut icons",
-                settings.grayscale_shortcuts,
-            ),
-            Field::check("Close popup after launching", settings.close_after_launch),
-            Field::check("Popup animations", settings.animations),
-            Field::check(
-                "Hand cursor on clickable popup items",
-                settings.pointer_cursor,
-            ),
-            Field::check("Check for updates automatically", settings.check_updates),
-        ];
         let mut fonts = ui::font_families();
         for current in [&settings.title_font, &settings.label_font] {
             if !current.is_empty() && !fonts.contains(current) {
@@ -1548,40 +1617,76 @@ impl Application {
             values: fonts.clone(),
             selected: fonts.iter().position(|font| font == current).unwrap_or(0),
         };
-        let mut fields = fields.into_iter().collect::<Vec<_>>();
-        fields.push(font_field("Folder title font", &settings.title_font));
-        fields.push(font_field("Icon label font", &settings.label_font));
+        // Two columns filled row by row, like the group editor; values follow this order.
+        let fields = [
+            Field::page("General"),
+            Field::choice(
+                "Group order",
+                &["Manual", "Alphabetical"],
+                usize::from(settings.group_sort == SortMode::Alphabetical),
+            ),
+            Field::check("Start with Windows", settings.start_with_windows),
+            Field::check("Show AppStack in the system tray", settings.show_tray),
+            Field::check("Check for updates automatically", settings.check_updates),
+            Field::check("Enable Launch all", settings.launch_all_enabled),
+            Field::check("Close popup after launching", settings.close_after_launch),
+            Field::check(
+                "Grayscale group shortcut icons",
+                settings.grayscale_shortcuts,
+            ),
+            Field::page("Appearance"),
+            Field::choice(
+                "Manager theme",
+                &["System", "Light", "Dark"],
+                theme_index(settings.main_theme),
+            ),
+            Field::choice(
+                "Popup theme",
+                &["System", "Light", "Dark"],
+                theme_index(settings.popup_theme),
+            ),
+            // Right above the two selects it fills.
+            Field::style("Font theme", font_themes(&fonts)),
+            Field::check("Popup animations", settings.animations),
+            font_field(TITLE_FONT_FIELD, &settings.title_font),
+            font_field(LABEL_FONT_FIELD, &settings.label_font),
+            Field::check(
+                "Hand cursor on clickable popup items",
+                settings.pointer_cursor,
+            ),
+        ];
         if let Some(values) = self.form("Preferences", &fields)? {
             let themes = [Theme::System, Theme::Light, Theme::Dark];
             let mut candidate = self.config.clone();
             let settings = &mut candidate.settings;
-            settings.main_theme = themes[values[0].parse::<usize>().unwrap_or(0).min(2)];
-            settings.popup_theme = themes[values[1].parse::<usize>().unwrap_or(0).min(2)];
-            settings.group_sort = if values[2] == "1" {
+            settings.group_sort = if values[0] == "1" {
                 SortMode::Alphabetical
             } else {
                 SortMode::Manual
             };
-            settings.start_with_windows = values[3] == "true";
-            settings.show_tray = values[4] == "true";
-            settings.launch_all_enabled = values[5] == "true";
+            settings.start_with_windows = values[1] == "true";
+            settings.show_tray = values[2] == "true";
+            settings.check_updates = values[3] == "true";
+            settings.launch_all_enabled = values[4] == "true";
+            settings.close_after_launch = values[5] == "true";
             settings.grayscale_shortcuts = values[6] == "true";
-            settings.close_after_launch = values[7] == "true";
-            settings.animations = values[8] == "true";
-            settings.pointer_cursor = values[9] == "true";
-            settings.check_updates = values[10] == "true";
+            settings.main_theme = themes[values[7].parse::<usize>().unwrap_or(0).min(2)];
+            settings.popup_theme = themes[values[8].parse::<usize>().unwrap_or(0).min(2)];
+            // The font theme only fills the selects below it, so it has no value of its own.
+            settings.animations = values[9] == "true";
             let font = |value: &String| {
                 value
                     .parse::<usize>()
                     .ok()
                     .and_then(|index| fonts.get(index).cloned())
             };
-            if let Some(title) = font(&values[11]) {
+            if let Some(title) = font(&values[10]) {
                 settings.title_font = title;
             }
-            if let Some(label) = font(&values[12]) {
+            if let Some(label) = font(&values[11]) {
                 settings.label_font = label;
             }
+            settings.pointer_cursor = values[12] == "true";
             self.job(Job::Startup(settings.start_with_windows));
             self.commit(candidate)?;
             ui::set_menu_theme(self.config.settings.main_theme);
@@ -1633,7 +1738,7 @@ impl Application {
 
     pub fn command(&mut self, id: u16) -> Result<(), String> {
         match id {
-            1 => self.show_manager(),
+            OPEN_MANAGER => self.show_manager(),
             NEW_GROUP => self.edit_group(true),
             EDIT_GROUP => self.edit_group(false),
             ADD_MANUAL => self.edit_entry(true),
@@ -1847,7 +1952,7 @@ impl Application {
         commands: &[(u16, &str)],
         point: POINT,
     ) -> Result<(), String> {
-        let chosen = choose(window, commands, point)?;
+        let chosen = choose(window, commands, point, false)?;
         if chosen != 0 {
             self.command(chosen)?;
         }
@@ -2305,6 +2410,12 @@ impl Application {
                             WPARAM(manager.title_font.0.0 as usize),
                             LPARAM(1),
                         );
+                        // Icons are rendered for one DPI; render them again for the new one.
+                        for (id, button) in &manager.buttons {
+                            if let Some(icon) = command_icon(*id) {
+                                ui::button_icon(*button, icon);
+                            }
+                        }
                         self.layout_manager();
                         self.refresh_manager();
                     }
@@ -2378,21 +2489,67 @@ impl Application {
                         self.show_manager()
                     }
                 } else if event.second as u32 == WM_RBUTTONUP {
-                    match choose(
-                        self.host,
-                        &[
-                            (1, "Open AppStack"),
+                    let group = self
+                        .tray_ids
+                        .iter()
+                        .find(|(id, _)| *id == event.first as u32)
+                        .and_then(|(_, id)| id.clone());
+                    if let Some(id) = group {
+                        // A group's own icon offers that group's actions first.
+                        let mut commands =
+                            vec![(OPEN_GROUP, "Open"), (EDIT_GROUP, "Edit group...")];
+                        if self.config.settings.launch_all_enabled {
+                            commands.push((LAUNCH_ALL, "Launch all"));
+                        }
+                        commands.extend([(0, ""), (OPEN_MANAGER, "Open AppStack"), (QUIT, "Exit")]);
+                        match choose(self.host, &commands, point, true)? {
+                            0 => Ok(()),
+                            OPEN_GROUP => self.open_popup(&id, point, None),
+                            LAUNCH_ALL => self.launch_group(&id),
+                            EDIT_GROUP => {
+                                self.selected = Some(id);
+                                self.manager_command(EDIT_GROUP)
+                            }
+                            other => self.command(other),
+                        }
+                    } else {
+                        // Groups come first, to open one straight from the tray.
+                        let groups: Vec<_> = self
+                            .config
+                            .ordered_groups()
+                            .into_iter()
+                            .take(20)
+                            .map(|group| (group.id.clone(), group.name.replace('&', "&&")))
+                            .collect();
+                        let mut commands: Vec<_> = groups
+                            .iter()
+                            .enumerate()
+                            .map(|(index, (_, name))| (TRAY_GROUPS + index as u16, name.as_str()))
+                            .collect();
+                        if !commands.is_empty() {
+                            commands.push((0, ""));
+                        }
+                        commands.extend([
+                            (OPEN_MANAGER, "Open AppStack"),
                             (NEW_GROUP, "New group..."),
                             (SETTINGS, "Preferences..."),
                             (CHECK_UPDATES, "Check for updates..."),
                             (0, ""),
                             (QUIT, "Exit"),
-                        ],
-                        point,
-                    )? {
-                        0 => Ok(()),
-                        NEW_GROUP => self.manager_command(NEW_GROUP),
-                        id => self.command(id),
+                        ]);
+                        match choose(self.host, &commands, point, true)? {
+                            0 => Ok(()),
+                            NEW_GROUP => self.manager_command(NEW_GROUP),
+                            id if id >= TRAY_GROUPS => {
+                                match groups.get(usize::from(id - TRAY_GROUPS)) {
+                                    Some((group, _)) => {
+                                        self.open_popup(&group.clone(), point, None)
+                                    }
+                                    None => Ok(()),
+                                }
+                            }
+                            id => self.command(id),
+                        }
                     }
                 } else {
                     Ok(())
@@ -2456,6 +2613,7 @@ impl Application {
                         window,
                         &[(EDIT_GROUP, "Edit group..."), (NEW_GROUP, "New group...")],
                         point,
+                        false,
                     )?;
                     if chosen == 0 {
                         return Ok(());
@@ -2678,16 +2836,7 @@ impl Application {
         animate: bool,
     ) -> Result<(), String> {
         let animate = animate && self.config.settings.animations;
-        let popup_clock = std::time::Instant::now();
-        let popup_trace = std::env::var_os("APPSTACK_STARTUP_TRACE");
-        let mut popup_stages = Vec::new();
-        macro_rules! popup_stage {
-            ($name:literal) => {
-                if popup_trace.is_some() {
-                    popup_stages.push(($name, popup_clock.elapsed().as_micros()));
-                }
-            };
-        }
+        let mut trace = Trace::new();
         if let Some(parent) = parent {
             return self.navigate(parent, Some(id));
         }
@@ -2747,7 +2896,9 @@ impl Application {
                     self.popups[index].path.clear();
                     self.show_folder(index)?;
                 }
-                show_popup(window, focus, animate)?;
+                trace.mark("placed");
+                show_popup(window, focus, animate, &mut trace)?;
+                trace.write("reused");
                 return Ok(());
             }
             let mut group = self.config.group(id).ok_or("Group not found")?.clone();
@@ -2756,7 +2907,7 @@ impl Application {
             } else {
                 group.ordered_entries().into_iter().cloned().collect()
             };
-            popup_stage!("entries");
+            trace.mark("entries");
             let window = ui::window(
                 "AppStack.Popup",
                 &group.name,
@@ -2773,9 +2924,9 @@ impl Application {
                 1,
                 1,
             )?;
-            popup_stage!("window");
+            trace.mark("window");
             let _ = shell::window_app_id(window, &shell::group_app_id(&group));
-            popup_stage!("shell_identity");
+            trace.mark("shell_identity");
             let _ = SetWindowPos(
                 window,
                 None,
@@ -2862,7 +3013,6 @@ impl Application {
                     600,
                 ),
                 Font::new(dpi, 13),
-                ui::icon_font(dpi, 16),
             ];
             // A single column hugs its longest name instead of the multi-column cell width.
             if columns == 1 && appearance.show_labels {
@@ -2882,8 +3032,8 @@ impl Application {
                 look.cell.0 = cell_width;
             }
             let gap = ui::scale(6, dpi);
-            let edit_width = ui::text_width(&fonts[2], "Edit") + ui::scale(24, dpi);
-            let all_width = ui::text_width(&fonts[2], "Launch all") + ui::scale(24, dpi);
+            // Square icon buttons, like the back button in subfolders.
+            let (edit_width, all_width) = (ui::scale(30, dpi), ui::scale(30, dpi));
             let buttons_width = i32::from(show_edit) * edit_width
                 + i32::from(show_all) * all_width
                 + i32::from(show_edit && show_all) * gap;
@@ -3041,8 +3191,20 @@ impl Application {
                 let height = ui::scale(30, dpi);
                 let top = band_top(bottom) + (band - height) / 2;
                 let buttons: Vec<_> = [
-                    (show_edit, EDIT_GROUP, "Edit", edit_width),
-                    (show_all, LAUNCH_ALL, "Launch all", all_width),
+                    (
+                        show_edit,
+                        EDIT_GROUP,
+                        "Edit",
+                        edit_width,
+                        ui::lucide::SETTINGS,
+                    ),
+                    (
+                        show_all,
+                        LAUNCH_ALL,
+                        "Launch all",
+                        all_width,
+                        ui::lucide::SQUARE_ARROW_OUT_UP_RIGHT,
+                    ),
                 ]
                 .into_iter()
                 .filter(|button| button.0)
@@ -3058,8 +3220,9 @@ impl Application {
                 if let Some(left) = positions.first() {
                     right_edge[usize::from(bottom)] = *left - gap;
                 }
-                for ((_, id, label, button_width), left) in buttons.into_iter().zip(positions) {
-                    let button = ui::child(window, w!("BUTTON"), label, id, WS_TABSTOP, &fonts[2])?;
+                for ((_, id, label, button_width, icon), left) in buttons.into_iter().zip(positions)
+                {
+                    let button = ui::ghost_button(window, label, icon, id, &fonts[2])?;
                     ui::place(button, left, top, button_width, height);
                 }
             }
@@ -3088,7 +3251,7 @@ impl Application {
                 );
                 title = Some(header_window);
             }
-            popup_stage!("layout_controls");
+            trace.mark("layout_controls");
             // AppStack animates popups itself, so DWM's own transition never doubles it.
             let transitions = BOOL::from(true);
             let _ = DwmSetWindowAttribute(
@@ -3117,7 +3280,7 @@ impl Application {
                     ui::scale(24, dpi),
                 );
             }
-            popup_stage!("theme");
+            trace.mark("theme");
             let index = self.popups.len();
             self.popups.push(Popup {
                 window,
@@ -3159,20 +3322,17 @@ impl Application {
                 outside: None,
             });
             self.render_popup(index)?;
-            popup_stage!("item_controls");
+            trace.mark("item_controls");
             if activate {
-                show_popup(window, list, animate)?;
+                show_popup(window, list, animate, &mut trace)?;
             } else {
                 self.hide_popups(index);
+                ui::prepare_edge(window);
             }
-            popup_stage!("visible");
+            trace.mark("visible");
             self.accept_drops(window);
         }
-        if let Some(path) = popup_trace {
-            let path = std::path::PathBuf::from(path).with_extension("popup.json");
-            let report = serde_json::json!({ "stages_us": popup_stages });
-            let _ = std::fs::write(path, report.to_string());
-        }
+        trace.write(if activate { "built" } else { "prepared" });
         Ok(())
     }
 
@@ -3612,9 +3772,9 @@ impl Application {
                 popup.back = Some(ui::ghost_button(
                     popup.window,
                     "Back",
-                    ui::BACK_GLYPH,
+                    ui::lucide::ARROW_LEFT,
                     BACK,
-                    &popup.fonts[3],
+                    &popup.fonts[2],
                 )?);
                 created = true;
             }
@@ -3937,10 +4097,36 @@ fn mouse_down() -> bool {
         .any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
 }
 
+/// The Lucide icon a command shows in buttons and menus.
+fn command_icon(id: u16) -> Option<usize> {
+    use ui::lucide as icon;
+    Some(match id {
+        OPEN_MANAGER => icon::LAYOUT_GRID,
+        NEW_GROUP => icon::FOLDER_PLUS,
+        EDIT_GROUP | EDIT_ENTRY => icon::PENCIL,
+        DUPLICATE_GROUP => icon::COPY,
+        DELETE_GROUP | DELETE_ENTRY => icon::TRASH_2,
+        OPEN_GROUP => icon::FOLDER_OPEN,
+        SHORTCUT => icon::LINK,
+        ADD_FILES => icon::PLUS,
+        ADD_SUBGROUP => icon::FOLDER_TREE,
+        LAUNCH_ENTRY => icon::PLAY,
+        LAUNCH_ADMIN => icon::SHIELD,
+        LAUNCH_ALL => icon::SQUARE_ARROW_OUT_UP_RIGHT,
+        SETTINGS => icon::SETTINGS,
+        CHECK_UPDATES => icon::REFRESH_CW,
+        QUIT => icon::LOG_OUT,
+        _ => return None,
+    })
+}
+
 /// Shows a context menu and returns the chosen command, or 0; a command 0 is a separator.
-fn choose(window: HWND, commands: &[(u16, &str)], point: POINT) -> Result<u16, String> {
+/// A tray menu opens toward the screen's middle, away from the taskbar, like Windows' own.
+fn choose(window: HWND, commands: &[(u16, &str)], point: POINT, tray: bool) -> Result<u16, String> {
     unsafe {
         let menu = CreatePopupMenu().map_err(failure)?;
+        let dpi = GetDpiForWindow(window).max(96);
+        let mut icons = Vec::new();
         for (id, title) in commands {
             let appended = if *id == 0 {
                 AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())
@@ -3951,19 +4137,37 @@ fn choose(window: HWND, commands: &[(u16, &str)], point: POINT) -> Result<u16, S
                 let _ = DestroyMenu(menu);
                 return Err(failure(error));
             }
+            if let Some(icon) = command_icon(*id) {
+                icons.push(ui::menu_icon(menu, *id, icon, dpi));
+            }
         }
+        let mut flags = TPM_RETURNCMD | TPM_RIGHTBUTTON;
+        if tray {
+            let mut monitor = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let _ = GetMonitorInfoW(
+                MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            );
+            let area = monitor.rcMonitor;
+            if point.y > (area.top + area.bottom) / 2 {
+                flags |= TPM_BOTTOMALIGN;
+            }
+            if point.x > (area.left + area.right) / 2 {
+                flags |= TPM_RIGHTALIGN;
+            }
+        }
+        // Without the foreground, and the null message after, a click elsewhere would leave a
+        // tray menu open and the next one would close at once.
         let _ = SetForegroundWindow(window);
-        let chosen = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            point.x,
-            point.y,
-            None,
-            window,
-            None,
-        )
-        .0;
+        let chosen = TrackPopupMenu(menu, flags, point.x, point.y, None, window, None).0;
+        let _ = PostMessageW(Some(window), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);
+        for icon in icons {
+            let _ = DeleteObject(icon.into());
+        }
         Ok(chosen as u16)
     }
 }
@@ -4050,6 +4254,94 @@ mod tests {
         for (name, pairs) in &styles[1..] {
             assert_eq!(labels(pairs), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn font_themes_offer_only_installed_pairs_as_select_indices() {
+        let fonts: Vec<String> = [TITLE_FONT, LABEL_FONT, "Segoe UI", "Georgia", "Verdana"]
+            .map(String::from)
+            .into();
+        let themes = font_themes(&fonts);
+        let names: Vec<_> = themes.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Choose a font theme…",
+                "AppStack (Space Grotesk, Inter)",
+                "Windows classic (Segoe UI)",
+                "Editorial (Georgia, Verdana)",
+            ]
+        );
+        let editorial = &themes[3].1;
+        assert_eq!(
+            editorial,
+            &[
+                (TITLE_FONT_FIELD.to_string(), "3".to_string()),
+                (LABEL_FONT_FIELD.to_string(), "4".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_group_editor_value_lands_in_the_setting_it_shows() {
+        let mut group = Group {
+            name: "Work".into(),
+            ..Group::default()
+        };
+        // Distinct values each select can show exactly, so a shifted index changes something.
+        let look = &mut group.appearance;
+        look.sort = SortMode::Alphabetical;
+        (look.grid_icon, look.mosaic_icon) = (true, true);
+        look.icon = "C:\\icon.ico".into();
+        look.show_on_tray = true;
+        look.card_layout = true;
+        look.corner_radius = ROUNDING_PRESETS[3].1;
+        look.tile_radius = ROUNDING_PRESETS[5].1;
+        look.border_width = BORDER_PRESETS[3].1;
+        look.border_color = "#112233".into();
+        look.accent = "#445566".into();
+        look.shadow = SHADOW_PRESETS[5].1;
+        look.columns = 7;
+        look.minimum_width = WIDTH_PRESETS[2].1;
+        look.gap_horizontal = SPACING_PRESETS[1].1;
+        look.gap_vertical = SPACING_PRESETS[2].1;
+        look.padding_horizontal = SPACING_PRESETS[3].1;
+        look.padding_vertical = SPACING_PRESETS[4].1;
+        look.scroll = true;
+        look.visible_rows = 12;
+        look.icon_size = ICON_PRESETS[4].1;
+        look.show_labels = false;
+        look.label_position = LabelPosition::Right;
+        look.label_size = LABEL_PRESETS[2].1;
+        look.show_header = false;
+        look.header_bottom = true;
+        look.show_edit_button = false;
+        look.button_position = ButtonPosition::Top;
+        look.button_alignment = ButtonAlignment::Center;
+        // What the form returns before anything is touched; see ui::form_values.
+        let values: Vec<String> = group_fields(&group)
+            .iter()
+            .filter_map(|field| match field {
+                ui::Field::Text { value, .. } | ui::Field::Color { value, .. } => {
+                    Some(value.clone())
+                }
+                ui::Field::Check { value, .. } => Some(value.to_string()),
+                ui::Field::Choice { selected, .. } => Some(selected.to_string()),
+                ui::Field::Preset {
+                    measurements,
+                    selected,
+                    ..
+                } => Some(measurements[*selected].to_string()),
+                ui::Field::Page { .. } | ui::Field::Style { .. } => None,
+            })
+            .collect();
+        let mut edited = Group::default();
+        apply_group_values(&mut edited, &values).unwrap();
+        assert_eq!(edited.name, group.name);
+        assert_eq!(
+            serde_json::to_value(&edited.appearance).unwrap(),
+            serde_json::to_value(&group.appearance).unwrap()
+        );
     }
 
     #[test]

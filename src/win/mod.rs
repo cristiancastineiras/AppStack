@@ -86,8 +86,48 @@ fn invocation_point() -> (POINT, Option<POINT>) {
     }
 }
 
+/// The forwarding side of an APPSTACK_STARTUP_TRACE popup trace, in `ui::epoch_us`: process
+/// creation, entry and each stage, one JSON line per invocation.
+fn trace_forward(path: &std::ffi::OsStr, main_us: u128, stages: &[(&str, u128)]) {
+    use std::io::Write;
+    let created_us = unsafe {
+        let (mut creation, mut exit, mut kernel, mut user) = Default::default();
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+        .ok()
+        .map(|_| {
+            // FILETIME counts 100 ns intervals from 1601.
+            let ticks =
+                (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+            u128::from(ticks / 10).saturating_sub(11_644_473_600_000_000)
+        })
+    };
+    let stages: Vec<_> = std::iter::once(("created", created_us.unwrap_or(0)))
+        .chain(std::iter::once(("main", main_us)))
+        .chain(
+            stages
+                .iter()
+                .map(|(name, elapsed)| (*name, main_us + elapsed)),
+        )
+        .collect();
+    let line = serde_json::json!({ "route": "forward", "stages_us": stages });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::Path::new(path).with_extension("forward.jsonl"))
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 pub fn run() -> Result<(), String> {
     let startup_clock = std::time::Instant::now();
+    let startup_epoch = ui::epoch_us();
     let startup_trace = std::env::var_os("APPSTACK_STARTUP_TRACE");
     let mut startup_stages = Vec::new();
     macro_rules! startup_stage {
@@ -210,6 +250,10 @@ pub fn run() -> Result<(), String> {
             if result.0 == 0 || accepted != 1 {
                 return Err("The running AppStack instance is not responding".into());
             }
+        }
+        startup_stage!("forwarded");
+        if let Some(path) = &startup_trace {
+            trace_forward(path, startup_epoch, &startup_stages);
         }
         return Ok(());
     }
