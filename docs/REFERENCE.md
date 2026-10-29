@@ -1,4 +1,6 @@
-# AppStack
+# AppStack technical reference
+
+Everything AppStack does, in detail. For the overview, screenshots and demo, see the [README](../README.md).
 
 Native application groups for Windows 10/11. One executable,
 `AppStackClassic.exe`, built with Rust and plain Win32: native editor, dialogs and
@@ -125,12 +127,12 @@ after rebuilding; Explorer may retain its own icon cache until it refreshes.
   as a small `.json` file to send to someone, who adds it with **Import popup
   style**; **Delete saved style** removes one. Saved styles live in
   `appstack.json`, so backups carry them. A group's icon path is never included.
-- **Community styles** come from [`styles/community.json`](styles/community.json)
+- **Community styles** come from [`styles/community.json`](../styles/community.json)
   in this repository. Each build includes the list as it was then; with **Check for
   updates automatically** on, AppStack also downloads the current list at start-up
   and once a day, so styles added later appear without updating AppStack. Every
   style is validated before use; invalid ones are skipped. To publish yours, see
-  [CONTRIBUTING.md](CONTRIBUTING.md#sharing-a-community-style).
+  [CONTRIBUTING.md](../CONTRIBUTING.md#sharing-a-community-style).
 - A live preview beside the settings shows the group's labels, icons, spacing,
   actions and rounding as controls change. Icons load asynchronously using the
   existing workers. Preview changes are not persisted until **Save**; **Cancel**
@@ -346,7 +348,7 @@ request. Releases are automated with release-please from
 `main` keep a release pull request up to date with the next version and its
 `CHANGELOG.md` entry, and merging it tags `vX.Y.Z`, publishes the GitHub release
 and attaches the installer and the portable executable. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the commit format.
+[CONTRIBUTING.md](../CONTRIBUTING.md) for the commit format.
 
 ## Code Layout
 
@@ -356,7 +358,7 @@ dispatcher, native editor and popups, Shell integration, COM drag/drop and worke
 queues. Win32 callbacks enqueue copied events; application state is updated outside
 the callbacks. Native icons, fonts, image lists and COM values have explicit owners.
 
-See LICENSE and THIRD-PARTY-NOTICES.md. [CONTRIBUTING.md](CONTRIBUTING.md),
-[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), [SECURITY.md](SECURITY.md) and
-[ACCESSIBILITY.md](ACCESSIBILITY.md) cover taking part, reporting
+See LICENSE and THIRD-PARTY-NOTICES.md. [CONTRIBUTING.md](../CONTRIBUTING.md),
+[CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md), [SECURITY.md](../SECURITY.md) and
+[ACCESSIBILITY.md](../ACCESSIBILITY.md) cover taking part, reporting
 vulnerabilities and accessibility.
