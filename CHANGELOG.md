@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/cristiancastineiras/AppStack/compare/v1.1.0...v1.2.0) (2026-10-29)
+
+
+### Features
+
+* **styles:** add saved, shared and community popup styles ([df00503](https://github.com/cristiancastineiras/AppStack/commit/df005036e5d08636223855faf66eb1895be1f48d))
+
 ## [1.1.0](https://github.com/cristiancastineiras/AppStack/compare/v1.0.0...v1.1.0) (2026-10-29)
 
 
