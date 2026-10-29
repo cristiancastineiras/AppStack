@@ -4,8 +4,9 @@ AppStack is MIT licensed. Dependencies are governed by their own licenses; the
 project license does not replace those terms.
 
 The executable embeds the Inter (Regular) and Space Grotesk (SemiBold) fonts,
-licensed under the SIL Open Font License 1.1. Their license texts are in `fonts/`
-and are copied into the portable package and the installation. The fonts are
+licensed under the SIL Open Font License 1.1. Their license texts are in `fonts/`,
+are copied into the installation, and come with every release in its source
+archives (the portable executable is a single file). The fonts are
 registered privately for the running process and are not installed on the system.
 
 Other direct dependencies include windows-rs (MIT/Apache-2.0), serde and

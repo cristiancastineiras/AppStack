@@ -14,6 +14,7 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=AppStackClassic=delayimp.lib");
         for library in [
             "combase", "ole32", "oleaut32", "advapi32", "dwmapi", "comctl32", "uxtheme", "shell32",
+            "winhttp",
         ] {
             println!("cargo:rustc-link-arg-bin=AppStackClassic=/DELAYLOAD:{library}.dll");
         }
@@ -74,8 +75,8 @@ fn main() {
 1 ICON "{}"
 1 24 "{}"
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION {numbers},0
+PRODUCTVERSION {numbers},0
 FILEOS 0x40004
 FILETYPE 1
 BEGIN
@@ -83,14 +84,16 @@ BEGIN
     VALUE "ProductName", "{binary}\0"
     VALUE "FileDescription", "{binary} - Application groups\0"
     VALUE "OriginalFilename", "{binary}.exe\0"
-    VALUE "FileVersion", "1.0.0\0"
-    VALUE "ProductVersion", "1.0.0\0"
+    VALUE "FileVersion", "{version}\0"
+    VALUE "ProductVersion", "{version}\0"
   END END
   BLOCK "VarFileInfo" BEGIN VALUE "Translation", 0x409, 1200 END
 END
 "#,
                 quote(&icon),
-                quote(&manifest)
+                quote(&manifest),
+                version = env!("CARGO_PKG_VERSION"),
+                numbers = env!("CARGO_PKG_VERSION").replace('.', ","),
             ),
         )
         .expect("write binary resources");

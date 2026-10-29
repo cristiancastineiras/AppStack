@@ -52,8 +52,7 @@ Section "${NAME}" SectionMain
     ExecWait '"$INSTDIR\${EXE}" --quit'
     Sleep 500
   SetOutPath "$INSTDIR"
-  ; portable.txt would move the data next to the program, so only the portable zip carries it.
-  File /x portable.txt "${SOURCE}\*.*"
+  File "${SOURCE}\*.*"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateShortcut "$SMPROGRAMS\${NAME}.lnk" "$INSTDIR\${EXE}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "${NAME}"
@@ -69,6 +68,15 @@ Section "${NAME}" SectionMain
   IntFmt $0 "0x%08X" $0
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "EstimatedSize" "$0"
 SectionEnd
+
+; AppStack's updater runs "setup.exe /S /RUN" and expects to be started again afterwards.
+Function .onInstSuccess
+  ${GetParameters} $0
+  ClearErrors
+  ${GetOptions} $0 "/RUN" $1
+  IfErrors +2
+    Exec '"$INSTDIR\${EXE}"'
+FunctionEnd
 
 Section /o "$(DesktopShortcut)" SectionDesktop
   CreateShortcut "$DESKTOP\${NAME}.lnk" "$INSTDIR\${EXE}"

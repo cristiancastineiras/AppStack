@@ -1,18 +1,35 @@
 # AppStack
 
-Native application groups for Windows 10/11, version 1.0.0. One executable,
+Native application groups for Windows 10/11. One executable,
 `AppStackClassic.exe`, built with Rust and plain Win32: native editor, dialogs and
 popups. No WinUI, Windows App SDK, .NET, Electron or WebView, and no runtime to
 install.
 
 ## Install
 
-`dist` contains a per-user installer (`AppStackClassic-1.0.0-setup.exe`, no
-administrator rights, English and Spanish) and a portable ZIP. The installer puts
-the program in `%LOCALAPPDATA%\Programs\AppStackClassic`, adds a Start menu
-shortcut (desktop shortcut optional) and registers an uninstaller under Installed
-apps. Uninstalling removes the program, its shortcuts and the start-with-Windows
-entry, and asks before deleting your groups.
+Download either file from the latest
+[GitHub release](https://github.com/cristiancastineiras/AppStack/releases/latest):
+
+- `AppStackClassic-setup.exe`, a per-user installer (no administrator rights,
+  English and Spanish). It puts the program in
+  `%LOCALAPPDATA%\Programs\AppStackClassic`, adds a Start menu shortcut (desktop
+  shortcut optional) and registers an uninstaller under Installed apps.
+  Uninstalling removes the program, its shortcuts and the start-with-Windows
+  entry, and asks before deleting your groups.
+- `AppStackClassic-portable.exe`, the whole program in one file. Run it from any
+  folder, such as a USB drive; it keeps its data in a `config` folder beside
+  itself. Keep `portable` in its file name, which is what makes it portable.
+
+## Updates
+
+AppStack checks the GitHub releases when it starts and once a day while it runs,
+and asks before installing a newer version. **Settings > Check for updates** (also
+in the tray menu) checks at once; **Preferences > Check for updates
+automatically** turns the automatic check off. Installed copies update by running
+the new installer silently; the portable executable replaces its own file. Either
+way AppStack restarts on the new version with your groups untouched. The updater
+only downloads over HTTPS from this repository's releases and checks the
+download's size.
 
 ## Build And Run
 
@@ -30,7 +47,7 @@ Use `-DebugBuild` for development and `-CheckOnly` for a type check. The script
 links the MSVC CRT statically, so the executable needs no Visual C++
 redistributable. `cargo classic` is a plain Cargo shortcut for a release build.
 Installers need NSIS (`makensis`) on `PATH`; without it the packager only
-produces the ZIP.
+produces the portable executable.
 
 ## Logo
 
@@ -144,9 +161,10 @@ applications are not embedded in backups.
 
 ## Storage
 
-The default data directory is `%LOCALAPPDATA%\AppStackClassic`. For portable use,
-put an empty `portable.txt` beside the executable, or pass `--portable`; data then
-lives in `config` beside the executable. `--data-dir` selects an explicit
+The default data directory is `%LOCALAPPDATA%\AppStackClassic`. An executable
+with `portable` in its file name (like the released
+`AppStackClassic-portable.exe`), an empty `portable.txt` beside the executable, or
+`--portable` keeps the data in `config` beside the executable instead. `--data-dir` selects an explicit
 directory. Each directory has its own resident instance.
 
 Shortcuts dragged into popups live in the data directory's `items` folder;
@@ -266,12 +284,21 @@ The focused `-EditorOnly` check verifies named selects, changing preview pixels,
 Cancel isolation, saved presets and an actual pill-shaped popup region; its
 screenshots are retained under `target/preview-*`.
 No elevation is requested. `package.ps1` checks formatting, Clippy and Rust tests,
-then creates the portable ZIP and the installer.
+then writes `dist\AppStackClassic-portable.exe` and `dist\AppStackClassic-setup.exe`.
 
 Before publishing, manually validate taskbar dragging/pinning on supported Windows
 versions, several monitors with mixed DPI, screen readers and administrator/UAC
-flows. These depend on the real desktop and system policy. No automatic update
-service or release endpoint is configured.
+flows. These depend on the real desktop and system policy.
+
+## Releases
+
+GitHub Actions runs formatting, Clippy and the tests on every push and pull
+request. Releases are automated with release-please from
+[Conventional Commit](https://www.conventionalcommits.org/) messages: pushes to
+`main` keep a release pull request up to date with the next version and its
+`CHANGELOG.md` entry, and merging it tags `vX.Y.Z`, publishes the GitHub release
+and attaches the installer and the portable executable. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the commit format.
 
 ## Code Layout
 
@@ -281,4 +308,7 @@ dispatcher, native editor and popups, Shell integration, COM drag/drop and worke
 queues. Win32 callbacks enqueue copied events; application state is updated outside
 the callbacks. Native icons, fonts, image lists and COM values have explicit owners.
 
-See LICENSE and THIRD-PARTY-NOTICES.md.
+See LICENSE and THIRD-PARTY-NOTICES.md. [CONTRIBUTING.md](CONTRIBUTING.md),
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), [SECURITY.md](SECURITY.md) and
+[ACCESSIBILITY.md](ACCESSIBILITY.md) cover taking part, reporting
+vulnerabilities and accessibility.

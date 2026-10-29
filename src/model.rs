@@ -122,6 +122,7 @@ pub struct Settings {
     pub close_after_launch: bool,
     pub animations: bool,
     pub pointer_cursor: bool,
+    pub check_updates: bool,
     pub title_font: String,
     pub label_font: String,
 }
@@ -139,6 +140,7 @@ impl Default for Settings {
             close_after_launch: true,
             animations: false,
             pointer_cursor: true,
+            check_updates: true,
             title_font: TITLE_FONT.into(),
             label_font: LABEL_FONT.into(),
         }
