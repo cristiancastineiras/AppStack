@@ -44,6 +44,23 @@ Keep changes focused: one fix or feature per pull request, written like the
 code around it (plain Win32 through the `windows` crate; no new runtime or UI
 framework). Mention any user-visible change in the README.
 
+## Sharing a community style
+
+Community styles are the entries of [`styles/community.json`](styles/community.json).
+Everyone running AppStack sees them under **Popup style** in the group editor,
+without updating the app, once your pull request is merged.
+
+1. Make a group look the way you like, then use **Group > Share popup style as a
+   file** to write it as a `.json` file.
+2. Add that object to the list in `styles/community.json`, with a short `name`
+   and your GitHub name as `author`. Keep only the settings you changed under
+   `appearance` if you like; the rest use AppStack's defaults.
+3. Open a pull request titled `feat(styles): add <name>`, with a screenshot of the
+   popup in light and dark themes.
+
+`cargo test` checks that every style in the file is valid (sizes in range, colors as
+`#RRGGBB`, names of at most 60 characters).
+
 ## Commit messages and releases
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/),

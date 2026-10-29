@@ -23,6 +23,8 @@ pub enum Job {
     /// Whether the user asked, so an automatic check stays quiet unless it finds something.
     CheckUpdate(bool),
     Update(Release),
+    /// Refreshes the community styles cache; failures keep the previous copy silently.
+    FetchStyles,
     Stop,
 }
 
@@ -267,6 +269,13 @@ impl Background {
                         let sender = sender.clone();
                         thread::spawn(move || {
                             deliver(&sender, owner, Completed::Release(manual, update::latest()))
+                        });
+                        continue;
+                    }
+                    Job::FetchStyles => {
+                        let root = store.root.clone();
+                        thread::spawn(move || {
+                            let _ = update::community_styles(&root);
                         });
                         continue;
                     }
