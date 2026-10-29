@@ -453,6 +453,102 @@ pub fn drag_shortcut(owner: HWND, path: &Path) -> Result<(), String> {
     }
 }
 
+/// Shortcut files only point at an application, so moving one never breaks what it opens.
+pub fn is_shortcut(path: &str) -> bool {
+    let path = Path::new(path);
+    path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("lnk") || extension.eq_ignore_ascii_case("url")
+    }) && path.is_file()
+}
+
+/// `canonicalize` gives `\\?\` paths, which the Shell and people read less reliably.
+pub fn plain(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{share}"))
+    } else if let Some(local) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(local)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Moves files into `folder` as Explorer does, with its prompts (such as administrator
+/// permission for the shared desktop) and its undo. Returns where each file ended up, or None
+/// for one that stayed where it was because it was skipped, cancelled or could not move.
+pub fn move_files(
+    owner: HWND,
+    files: &[PathBuf],
+    folder: &Path,
+) -> Result<Vec<Option<PathBuf>>, String> {
+    let inside = |file: &PathBuf| {
+        file.parent().is_some_and(|parent| {
+            parent
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&folder.to_string_lossy())
+        })
+    };
+    let mut placed: Vec<_> = files
+        .iter()
+        .map(|file| inside(file).then(|| file.clone()))
+        .collect();
+    let mut moves = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        if placed[index].is_some() {
+            continue;
+        }
+        let stem = file.file_stem().unwrap_or_default().to_string_lossy();
+        let extension = file
+            .extension()
+            .map(|extension| format!(".{}", extension.to_string_lossy()))
+            .unwrap_or_default();
+        // Explorer's own "Name (2)" when the name is taken.
+        if let Some(destination) = (1..)
+            .map(|number| {
+                folder.join(if number == 1 {
+                    format!("{stem}{extension}")
+                } else {
+                    format!("{stem} ({number}){extension}")
+                })
+            })
+            .find(|candidate| {
+                !candidate.exists() && moves.iter().all(|(_, taken)| taken != candidate)
+            })
+        {
+            moves.push((index, destination));
+        }
+    }
+    if moves.is_empty() {
+        return Ok(placed);
+    }
+    std::fs::create_dir_all(folder).map_err(failure)?;
+    unsafe {
+        let operation: IFileOperation =
+            CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(failure)?;
+        operation.SetOwnerWindow(owner).map_err(failure)?;
+        operation
+            .SetOperationFlags(FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR)
+            .map_err(failure)?;
+        let target: IShellItem =
+            SHCreateItemFromParsingName(PCWSTR(wide(folder).as_ptr()), None).map_err(failure)?;
+        for (index, destination) in &moves {
+            let item: IShellItem =
+                SHCreateItemFromParsingName(PCWSTR(wide(&files[*index]).as_ptr()), None)
+                    .map_err(failure)?;
+            let name = wide(destination.file_name().unwrap_or_default());
+            operation
+                .MoveItem(&item, &target, PCWSTR(name.as_ptr()), None)
+                .map_err(failure)?;
+        }
+        // Cancelling or skipping a file is the person's choice; it simply stays where it was.
+        let _ = operation.PerformOperations();
+    }
+    for (index, destination) in moves {
+        placed[index] = destination.is_file().then_some(destination);
+    }
+    Ok(placed)
+}
+
 pub fn desktop() -> Result<PathBuf, String> {
     unsafe {
         let path =
@@ -466,6 +562,46 @@ pub fn desktop() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_shortcuts_renames_taken_names_and_keeps_files_already_inside() {
+        let _apartment = Apartment::new().unwrap();
+        let root = std::env::temp_dir().join(format!("AppStack move test {}", new_id()));
+        let (desktop, items) = (root.join("Desktop"), root.join("items"));
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::create_dir_all(&items).unwrap();
+        for name in ["Editor.lnk", "Game.url"] {
+            std::fs::write(desktop.join(name), name).unwrap();
+        }
+        std::fs::write(items.join("Editor.lnk"), "taken").unwrap();
+        assert!(is_shortcut(&desktop.join("Game.url").to_string_lossy()));
+        assert!(!is_shortcut(&desktop.join("Missing.lnk").to_string_lossy()));
+        let files = [
+            desktop.join("Editor.lnk"),
+            desktop.join("Game.url"),
+            items.join("Editor.lnk"),
+        ];
+        let placed = move_files(HWND::default(), &files, &items).unwrap();
+        assert_eq!(
+            placed,
+            [
+                Some(items.join("Editor (2).lnk")),
+                Some(items.join("Game.url")),
+                Some(items.join("Editor.lnk")),
+            ]
+        );
+        assert!(!desktop.join("Editor.lnk").exists() && !desktop.join("Game.url").exists());
+        assert_eq!(
+            std::fs::read_to_string(items.join("Editor (2).lnk")).unwrap(),
+            "Editor.lnk"
+        );
+        assert_eq!(plain(Path::new(r"\\?\C:\Data")), Path::new(r"C:\Data"));
+        assert_eq!(
+            plain(Path::new(r"\\?\UNC\server\share")),
+            Path::new(r"\\server\share")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn shortcuts_preserve_identifiers_and_paths_after_rename() {

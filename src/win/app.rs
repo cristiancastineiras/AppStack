@@ -10,7 +10,7 @@ use super::{
 use appstack::{
     command::{Action, Request},
     model::*,
-    storage::{Store, display_name, selected_with_dependencies},
+    storage::{ITEMS, Store, display_name, selected_with_dependencies},
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -55,6 +55,7 @@ const ENTRY_ICON: u16 = 210;
 const LAUNCH_ALL: u16 = 211;
 const BACK: u16 = 213;
 const ANIMATION: usize = 1;
+const WATCH: usize = 2;
 const IMPORT: u16 = 301;
 const IMPORT_FOLDER: u16 = 302;
 const EXPORT: u16 = 303;
@@ -116,6 +117,9 @@ fn show_popup(window: HWND, focus: HWND, animate: bool) -> Result<(), String> {
         let _ = RemovePropW(window, w!("AppStack.PopupReady"));
         if animate {
             ui::animate_in(window, focus);
+        } else if GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0 != 0 {
+            // A layered popup shows nothing until it has an opacity.
+            let _ = SetLayeredWindowAttributes(window, COLORREF(0), 255, LWA_ALPHA);
         }
         let _ = ShowWindow(window, SW_SHOWNORMAL);
         let _ = RedrawWindow(Some(window), None, None, RDW_ALLCHILDREN | RDW_UPDATENOW);
@@ -482,6 +486,10 @@ struct Popup {
     paged: bool,
     target: i32,
     flipped: Option<std::time::Instant>,
+    /// Takes applications dropped on the popup, as a folder does.
+    drop_target: Option<IDropTarget>,
+    /// While inactive and still open: whether a mouse button went down outside it since.
+    outside: Option<bool>,
 }
 
 impl Popup {
@@ -514,6 +522,9 @@ impl Drop for Popup {
             ui::forget_ghost(back);
         }
         unsafe {
+            if self.drop_target.is_some() {
+                let _ = RevokeDragDrop(self.window);
+            }
             let _ = DestroyWindow(self.window);
         }
     }
@@ -540,6 +551,8 @@ pub struct Application {
     tray_ids: Vec<(u32, Option<String>)>,
     pub taskbar_created: u32,
     pub quitting: bool,
+    /// Drag and drop for popups, set up with the first one; popups go before it.
+    ole: Option<shell::OleApartment>,
 }
 
 impl Application {
@@ -579,6 +592,7 @@ impl Application {
             tray_ids: Vec::new(),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             quitting: false,
+            ole: None,
         })
     }
 
@@ -600,7 +614,7 @@ impl Application {
             .collect();
         for id in groups {
             if let Some(anchor) = self.taskbar_point(&id, point) {
-                self.build_popup(&id, anchor, None, false)?;
+                self.build_popup(&id, anchor, None, false, false)?;
             }
         }
         Ok(())
@@ -851,7 +865,7 @@ impl Application {
                 group_specs: Vec::new(),
                 entry_specs: Vec::new(),
                 dpi,
-                _drop_target: drop_target::register(entries)?,
+                _drop_target: drop_target::register(entries, false)?,
                 _ole: ole,
             });
             self.install_menu(window)?;
@@ -1139,15 +1153,24 @@ impl Application {
     }
 
     pub(super) fn commit(&mut self, candidate: Config) -> Result<(), String> {
+        self.apply(candidate, true)
+    }
+
+    /// Saves a configuration and closes the popups built from the old one. Icons are cached by
+    /// their sources, so adding applications can keep them; other edits may have rewritten an
+    /// icon file in place and `reload_icons` drops them.
+    fn apply(&mut self, candidate: Config, reload_icons: bool) -> Result<(), String> {
         candidate.validate()?;
         self.config = candidate;
         ui::set_pointer(self.config.settings.pointer_cursor);
-        self.generation = self.generation.wrapping_add(1);
         self.popups.clear();
         self.parked.clear();
-        self.icon_cache.clear();
-        self.icon_order.clear();
-        self.pending.clear();
+        if reload_icons {
+            self.generation = self.generation.wrapping_add(1);
+            self.icon_cache.clear();
+            self.icon_order.clear();
+            self.pending.clear();
+        }
         self.job(Job::Save(self.config.clone()));
         self.job(Job::Synchronize(self.config.clone()));
         self.refresh_manager();
@@ -1421,24 +1444,7 @@ impl Application {
     pub fn add_targets(&mut self, targets: Vec<(String, String)>) -> Result<(), String> {
         let index = self.group_index().ok_or("No group selected")?;
         let mut candidate = self.config.clone();
-        for (path, name) in targets {
-            if candidate.groups[index]
-                .entries
-                .iter()
-                .any(|entry| entry.target == Target::Application(path.clone()))
-            {
-                continue;
-            }
-            candidate.groups[index].entries.push(Entry {
-                name: if name.is_empty() {
-                    display_name(&path)
-                } else {
-                    name
-                },
-                target: Target::Application(path),
-                ..Entry::default()
-            });
-        }
+        append_targets(&mut candidate.groups[index], targets);
         self.commit(candidate)
     }
 
@@ -1812,29 +1818,18 @@ impl Application {
         commands: &[(u16, &str)],
         point: POINT,
     ) -> Result<(), String> {
-        unsafe {
-            let menu = CreatePopupMenu().map_err(failure)?;
-            for (id, title) in commands {
-                AppendMenuW(menu, MF_STRING, *id as usize, PCWSTR(wide(title).as_ptr()))
-                    .map_err(failure)?;
-            }
-            let _ = SetForegroundWindow(window);
-            let chosen = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                point.x,
-                point.y,
-                None,
-                window,
-                None,
-            )
-            .0;
-            let _ = DestroyMenu(menu);
-            if chosen != 0 {
-                self.command(chosen as u16)?;
-            }
+        let chosen = choose(window, commands, point)?;
+        if chosen != 0 {
+            self.command(chosen)?;
         }
         Ok(())
+    }
+
+    /// Group commands from a popup or the tray open the manager first, like the popup's Edit
+    /// button, so the editor has its owner and the result is visible.
+    fn manager_command(&mut self, id: u16) -> Result<(), String> {
+        self.show_manager()?;
+        self.command(id)
     }
 
     pub fn event(&mut self, event: ui::Event) -> Result<(), String> {
@@ -1908,7 +1903,40 @@ impl Application {
                     Ok(())
                 }
             }
-            ui::DROP => self.add_targets(serde_json::from_str(&event.text).map_err(failure)?),
+            ui::DROP => {
+                let dropped: drop_target::Dropped =
+                    serde_json::from_str(&event.text).map_err(failure)?;
+                if let Some(index) = self
+                    .popups
+                    .iter()
+                    .position(|popup| popup.window == event.window)
+                {
+                    self.drop_into(index, dropped)
+                } else if self
+                    .manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.entries == event.window)
+                {
+                    self.add_targets(dropped.items)
+                } else {
+                    // The popup closed before its drop arrived; nothing moved, so nothing is lost.
+                    Ok(())
+                }
+            }
+            ui::DRAG => {
+                if let Some(index) = self
+                    .popups
+                    .iter()
+                    .position(|popup| popup.window == event.window)
+                {
+                    // Only a subgroup takes the drop itself, so only a subgroup lights up.
+                    let tile = (event.first != 0)
+                        .then(|| drop_target::unpack(event.second))
+                        .and_then(|point| self.subgroup_at(index, point));
+                    ui::track_hover(self.popups[index].list, tile.map(|(_, point)| point));
+                }
+                Ok(())
+            }
             ui::BEGIN_DRAG => {
                 if !self.manager.as_ref().is_some_and(|manager| {
                     event.window == manager.groups || event.window == manager.entries
@@ -2120,6 +2148,34 @@ impl Application {
                     self.command(id)
                 }
             }
+            WM_TIMER if event.first == WATCH => {
+                let Some(index) = self
+                    .popups
+                    .iter()
+                    .position(|popup| popup.window == event.window)
+                else {
+                    return Ok(());
+                };
+                let foreground = unsafe { GetForegroundWindow() };
+                let active = self.popups.iter().any(|popup| {
+                    popup.window == foreground
+                        || unsafe { IsChild(popup.window, foreground).as_bool() }
+                });
+                let popup = &mut self.popups[index];
+                let pressed = popup.outside == Some(true);
+                // Activation back in a popup hands closing over to WM_ACTIVATE again.
+                if active || popup.outside.is_none() {
+                    popup.outside = None;
+                    unsafe {
+                        let _ = KillTimer(Some(popup.window), WATCH);
+                    }
+                } else if mouse_down() {
+                    popup.outside = Some(true);
+                } else if pressed && !drop_target::dragging_over(popup.window) {
+                    self.hide_popups(0);
+                }
+                Ok(())
+            }
             WM_TIMER => {
                 if let Some(index) = self
                     .popups
@@ -2170,13 +2226,22 @@ impl Application {
                 Ok(())
             }
             WM_ACTIVATE if event.first & 0xFFFF == WA_INACTIVE as usize => {
-                if self.popups.iter().any(|popup| popup.window == event.window) {
+                if let Some(index) = self
+                    .popups
+                    .iter()
+                    .position(|popup| popup.window == event.window)
+                {
                     let next = unsafe { GetForegroundWindow() };
                     let within = self.popups.iter().any(|popup| {
                         popup.window == next || unsafe { IsChild(popup.window, next).as_bool() }
                     });
                     if !within {
-                        self.hide_popups(0);
+                        if mouse_down() {
+                            // The press may be picking up an icon to drop here, like on a folder.
+                            self.watch(index, true);
+                        } else {
+                            self.hide_popups(0);
+                        }
                     }
                 }
                 Ok(())
@@ -2278,23 +2343,36 @@ impl Application {
                         self.show_manager()
                     }
                 } else if event.second as u32 == WM_RBUTTONUP {
-                    self.menu_at(
+                    match choose(
                         self.host,
                         &[
                             (1, "Open AppStack"),
+                            (NEW_GROUP, "New group..."),
                             (SETTINGS, "Preferences..."),
+                            (0, ""),
                             (QUIT, "Exit"),
                         ],
                         point,
-                    )
+                    )? {
+                        0 => Ok(()),
+                        NEW_GROUP => self.manager_command(NEW_GROUP),
+                        id => self.command(id),
+                    }
                 } else {
                     Ok(())
                 }
             }
             WM_CONTEXTMENU => {
-                let mut point = POINT::default();
-                unsafe {
-                    let _ = GetCursorPos(&mut point);
+                // The click's screen position, or -1 when the keyboard asked for the menu.
+                let keyboard = event.second as u32 == u32::MAX;
+                let mut point = POINT {
+                    x: (event.second & 0xFFFF) as i16 as i32,
+                    y: ((event.second >> 16) & 0xFFFF) as i16 as i32,
+                };
+                if keyboard {
+                    unsafe {
+                        let _ = GetCursorPos(&mut point);
+                    }
                 }
                 let source = HWND(event.first as *mut _);
                 if self
@@ -2302,17 +2380,52 @@ impl Application {
                     .as_ref()
                     .is_some_and(|manager| manager.groups == source)
                 {
-                    self.menu_at(
-                        self.owner(),
-                        &[
-                            (OPEN_GROUP, "Open"),
-                            (EDIT_GROUP, "Edit..."),
-                            (DUPLICATE_GROUP, "Duplicate"),
-                            (SHORTCUT, "Create desktop shortcut"),
-                            (DELETE_GROUP, "Delete"),
-                        ],
+                    // The keyboard acts on the selection; a click on empty space only creates.
+                    let mut hit = LVHITTESTINFO {
+                        pt: point,
+                        ..Default::default()
+                    };
+                    unsafe {
+                        let _ = ScreenToClient(source, &mut hit.pt);
+                    }
+                    let on_group = keyboard
+                        || ui::send(
+                            source,
+                            LVM_HITTEST,
+                            WPARAM(0),
+                            LPARAM(&mut hit as *mut _ as isize),
+                        )
+                        .0 >= 0;
+                    let group_commands = [
+                        (OPEN_GROUP, "Open"),
+                        (EDIT_GROUP, "Edit..."),
+                        (DUPLICATE_GROUP, "Duplicate"),
+                        (SHORTCUT, "Create desktop shortcut"),
+                        (DELETE_GROUP, "Delete"),
+                        (0, ""),
+                    ];
+                    let commands: Vec<_> = group_commands
+                        .into_iter()
+                        .filter(|_| on_group)
+                        .chain([(NEW_GROUP, "New group...")])
+                        .collect();
+                    self.menu_at(self.owner(), &commands, point)
+                } else if let Some(index) = self.popups.iter().position(|popup| {
+                    popup.window == event.window || popup.viewport == event.window
+                }) {
+                    // Like the Edit button, editing acts on the folder the popup shows.
+                    let window = self.popups[index].window;
+                    let current = self.popups[index].current().to_string();
+                    let chosen = choose(
+                        window,
+                        &[(EDIT_GROUP, "Edit group..."), (NEW_GROUP, "New group...")],
                         point,
-                    )
+                    )?;
+                    if chosen == 0 {
+                        return Ok(());
+                    }
+                    self.selected = Some(current);
+                    self.manager_command(chosen)
                 } else if self
                     .manager
                     .as_ref()
@@ -2480,7 +2593,7 @@ impl Application {
         point: POINT,
         parent: Option<usize>,
     ) -> Result<(), String> {
-        self.build_popup(id, point, parent, true)
+        self.build_popup(id, point, parent, true, true)
     }
 
     fn build_popup(
@@ -2489,7 +2602,9 @@ impl Application {
         point: POINT,
         parent: Option<usize>,
         activate: bool,
+        animate: bool,
     ) -> Result<(), String> {
+        let animate = animate && self.config.settings.animations;
         let popup_clock = std::time::Instant::now();
         let popup_trace = std::env::var_os("APPSTACK_STARTUP_TRACE");
         let mut popup_stages = Vec::new();
@@ -2559,7 +2674,7 @@ impl Application {
                     self.popups[index].path.clear();
                     self.show_folder(index)?;
                 }
-                show_popup(window, focus, self.config.settings.animations)?;
+                show_popup(window, focus, animate)?;
                 return Ok(());
             }
             let mut group = self.config.group(id).ok_or("Group not found")?.clone();
@@ -2808,6 +2923,19 @@ impl Application {
                         }) as isize,
                 ),
             );
+            // The list's tooltip is an unowned window, so a topmost popup would cover it.
+            let tooltip = ui::send(list, LVM_GETTOOLTIPS, WPARAM(0), LPARAM(0));
+            if tooltip.0 != 0 {
+                let _ = SetWindowPos(
+                    HWND(tooltip.0 as *mut _),
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
             ui::send(
                 list,
                 LVM_SETICONSPACING,
@@ -2954,15 +3082,18 @@ impl Application {
                     && rows as i32 * cell_height - look.gap.1 > viewport_height,
                 target: 0,
                 flipped: None,
+                drop_target: None,
+                outside: None,
             });
             self.render_popup(index)?;
             popup_stage!("item_controls");
             if activate {
-                show_popup(window, list, self.config.settings.animations)?;
+                show_popup(window, list, animate)?;
             } else {
                 self.hide_popups(index);
             }
             popup_stage!("visible");
+            self.accept_drops(window);
         }
         if let Some(path) = popup_trace {
             let path = std::path::PathBuf::from(path).with_extension("popup.json");
@@ -3465,6 +3596,14 @@ impl Application {
             if created {
                 ui::apply_theme(popup.window, theme, &[], accent);
             }
+        } else {
+            // Back at the root of a popup that grew a band for its subfolders: the band is gone,
+            // so its arrow and title must not stay over the icons.
+            for control in [popup.back, popup.title].into_iter().flatten() {
+                unsafe {
+                    let _ = ShowWindow(control, SW_HIDE);
+                }
+            }
         }
         ui::set_text(popup.window, &name);
         let rows = popup.entries.len().div_ceil(popup.columns) as i32;
@@ -3506,6 +3645,152 @@ impl Application {
         }
     }
 
+    /// Lets applications be dropped on a popup like on a folder, once it has been painted.
+    fn accept_drops(&mut self, window: HWND) {
+        if self.ole.is_none() {
+            self.ole = shell::OleApartment::new().ok();
+        }
+        if self.ole.is_none() {
+            return;
+        }
+        if let Some(popup) = self
+            .popups
+            .iter_mut()
+            .chain(self.parked.iter_mut())
+            .find(|popup| popup.window == window)
+        {
+            if popup.drop_target.is_none() {
+                popup.drop_target = drop_target::register(window, true).ok();
+            }
+        }
+    }
+
+    /// The subgroup tile under a screen point, which takes a drop like a folder icon does, and
+    /// the point in its list.
+    fn subgroup_at(&self, index: usize, point: POINT) -> Option<(String, POINT)> {
+        let popup = &self.popups[index];
+        let mut client = point;
+        let mut bounds = RECT::default();
+        unsafe {
+            let _ = ScreenToClient(popup.list, &mut client);
+            let _ = GetClientRect(popup.list, &mut bounds);
+        }
+        if !(bounds.left..bounds.right).contains(&client.x)
+            || !(bounds.top..bounds.bottom).contains(&client.y)
+        {
+            return None;
+        }
+        let slot = popup.slots.get(ui::hit_item(popup.list, client)?)?;
+        match &popup.entries.get(slot.entry)?.target {
+            Target::Group(id) => Some((id.clone(), client)),
+            Target::Application(_) => None,
+        }
+    }
+
+    /// Adds applications dropped on a popup to the folder it shows, or to the subgroup tile they
+    /// landed on. Like Explorer, a move takes shortcut files out of their folder into AppStack's
+    /// data, and entries anywhere that pointed at them follow. The popup reopens where it was.
+    fn drop_into(&mut self, index: usize, dropped: drop_target::Dropped) -> Result<(), String> {
+        let point = POINT {
+            x: dropped.point.0,
+            y: dropped.point.1,
+        };
+        let target = match self.subgroup_at(index, point) {
+            Some((id, _)) => id,
+            None => self.popups[index].current().to_string(),
+        };
+        let popup = &self.popups[index];
+        let (window, root, path, dpi) = (
+            popup.window,
+            popup.group_id.clone(),
+            popup.path.clone(),
+            popup.dpi,
+        );
+        let mut bounds = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(window, &mut bounds);
+        }
+        let mut items = dropped.items;
+        let mut moved = Vec::new();
+        if dropped.moving {
+            let shortcuts: Vec<_> = (0..items.len())
+                .filter(|index| shell::is_shortcut(&items[*index].0))
+                .collect();
+            let files: Vec<_> = shortcuts
+                .iter()
+                .map(|index| std::path::PathBuf::from(&items[*index].0))
+                .collect();
+            let folder = shell::plain(&self.store.root).join(ITEMS);
+            for (index, destination) in shortcuts
+                .into_iter()
+                .zip(shell::move_files(window, &files, &folder)?)
+            {
+                if let Some(destination) = destination {
+                    let destination = destination.to_string_lossy().into_owned();
+                    let source = std::mem::replace(&mut items[index].0, destination.clone());
+                    moved.push((source, destination));
+                }
+            }
+        }
+        let mut candidate = self.config.clone();
+        for entry in candidate
+            .groups
+            .iter_mut()
+            .flat_map(|group| group.entries.iter_mut())
+        {
+            for (source, destination) in &moved {
+                if let Target::Application(path) = &mut entry.target {
+                    if same_path(path, source) {
+                        *path = destination.clone();
+                    }
+                }
+                if same_path(&entry.icon, source) {
+                    entry.icon = destination.clone();
+                }
+            }
+        }
+        let group = candidate
+            .groups
+            .iter_mut()
+            .find(|group| group.id == target)
+            .ok_or("Group not found")?;
+        append_targets(group, items);
+        self.apply(candidate, false)?;
+        // Anchored at its old bottom center, the rebuilt popup grows upwards as it opens.
+        self.build_popup(
+            &root,
+            POINT {
+                x: (bounds.left + bounds.right) / 2,
+                y: bounds.bottom + ui::scale(8, dpi),
+            },
+            None,
+            true,
+            false,
+        )?;
+        let Some(index) = self.popups.iter().position(|popup| popup.group_id == root) else {
+            return Ok(());
+        };
+        if !path.is_empty() && path.iter().all(|id| self.config.group(id).is_some()) {
+            self.popups[index].path = path;
+            self.show_folder(index)?;
+        }
+        // Explorer still has activation after its drag, so the popup waits for the next press.
+        if unsafe { GetForegroundWindow() } != self.popups[index].window {
+            self.watch(index, false);
+        }
+        Ok(())
+    }
+
+    /// Keeps a popup open while it has no activation, as when a press outside it may be starting
+    /// a drag onto it; the popup closes once a press outside it ends without a drop on it.
+    fn watch(&mut self, index: usize, pressed: bool) {
+        let popup = &mut self.popups[index];
+        popup.outside = Some(pressed);
+        unsafe {
+            SetTimer(Some(popup.window), WATCH, 50, None);
+        }
+    }
+
     pub fn dialog_window(&self, window: HWND) -> Option<HWND> {
         let root = unsafe { GetAncestor(window, GA_ROOT) };
         if self
@@ -3524,10 +3809,12 @@ impl Application {
         if from >= self.popups.len() {
             return;
         }
-        for popup in self.popups.split_off(from).into_iter().rev() {
+        for mut popup in self.popups.split_off(from).into_iter().rev() {
             ui::track_hover(popup.list, None);
+            popup.outside = None;
             unsafe {
                 let _ = KillTimer(Some(popup.viewport), ANIMATION);
+                let _ = KillTimer(Some(popup.window), WATCH);
             }
             let tooltip = ui::send(popup.list, LVM_GETTOOLTIPS, WPARAM(0), LPARAM(0));
             if tooltip.0 != 0 {
@@ -3541,6 +3828,70 @@ impl Application {
         while self.parked.len() > 4 {
             self.parked.pop_back();
         }
+    }
+}
+
+/// Windows paths ignore case and take either slash.
+fn same_path(first: &str, second: &str) -> bool {
+    let normal = |path: &str| path.replace('/', "\\").to_lowercase();
+    normal(first) == normal(second)
+}
+
+/// Adds the applications a group does not have yet; an empty name becomes the file's.
+fn append_targets(group: &mut Group, targets: Vec<(String, String)>) {
+    for (path, name) in targets {
+        if group.entries.iter().any(|entry| {
+            matches!(&entry.target, Target::Application(existing) if same_path(existing, &path))
+        }) {
+            continue;
+        }
+        group.entries.push(Entry {
+            name: if name.is_empty() {
+                display_name(&path)
+            } else {
+                name
+            },
+            target: Target::Application(path),
+            ..Entry::default()
+        });
+    }
+}
+
+/// Whether any mouse button is held, wherever the cursor is.
+fn mouse_down() -> bool {
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+        .iter()
+        .any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
+}
+
+/// Shows a context menu and returns the chosen command, or 0; a command 0 is a separator.
+fn choose(window: HWND, commands: &[(u16, &str)], point: POINT) -> Result<u16, String> {
+    unsafe {
+        let menu = CreatePopupMenu().map_err(failure)?;
+        for (id, title) in commands {
+            let appended = if *id == 0 {
+                AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())
+            } else {
+                AppendMenuW(menu, MF_STRING, *id as usize, PCWSTR(wide(title).as_ptr()))
+            };
+            if let Err(error) = appended {
+                let _ = DestroyMenu(menu);
+                return Err(failure(error));
+            }
+        }
+        let _ = SetForegroundWindow(window);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            point.x,
+            point.y,
+            None,
+            window,
+            None,
+        )
+        .0;
+        let _ = DestroyMenu(menu);
+        Ok(chosen as u16)
     }
 }
 
@@ -3601,6 +3952,7 @@ impl Drop for Application {
             );
         }
         self.popups.clear();
+        self.parked.clear();
         self.manager.take();
         unsafe {
             let _ = DestroyWindow(self.host);

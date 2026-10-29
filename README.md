@@ -47,6 +47,19 @@ after rebuilding; Explorer may retain its own icon cache until it refreshes.
   dragging inside their lists or using their menu commands.
 - Add files through the native picker, drag applications from Explorer or
   `shell:AppsFolder`, or enter a path, URL or Shell identifier manually.
+- Popups work like folders: drag applications onto an open popup to add them to
+  the folder it shows, or onto a subgroup tile (it lights up) to add them to that
+  subgroup. As when moving between Explorer folders, shortcut files (`.lnk`,
+  `.url`) leave where they were, such as the desktop, for the data folder's
+  `items`; hold Ctrl to leave them in place. Programs, documents and Start menu
+  apps are only referenced. Moves use Explorer's own file operation, so its
+  prompts (administrator permission for the shared Public desktop) and Undo
+  apply, and entries in any group that pointed at a moved shortcut follow it. The
+  popup stays open while a mouse button is held outside it, so an icon can be
+  picked up and dropped on it; a press outside that ends without a drop closes it.
+- Right-click a popup for **Edit group** (the folder shown) and **New group**.
+  The manager's group list and the tray menu also offer **New group**; in the
+  group list, empty space offers only that.
 - Support for Win32 applications, Windows apps, `.lnk`, `.url`, Steam shortcuts,
   PWAs, arguments, custom icons, tooltips and administrator execution.
 - Add existing groups as subgroups. Cycles are rejected. Launch all follows
@@ -125,8 +138,9 @@ with selected parents. Existing groups are never replaced: identifiers are
 remapped, original files remain untouched, and available custom icons are copied.
 Unavailable application paths are retained for repair, not silently deleted.
 
-AppStack exports `.agz` ZIP archives containing its versioned JSON and custom
-image assets. Installed applications are not embedded in backups.
+AppStack exports `.agz` ZIP archives containing its versioned JSON, custom
+image assets and the shortcut files dropped into its `items` folder. Installed
+applications are not embedded in backups.
 
 ## Storage
 
@@ -134,6 +148,9 @@ The default data directory is `%LOCALAPPDATA%\AppStackClassic`. For portable use
 put an empty `portable.txt` beside the executable, or pass `--portable`; data then
 lives in `config` beside the executable. `--data-dir` selects an explicit
 directory. Each directory has its own resident instance.
+
+Shortcuts dragged into popups live in the data directory's `items` folder;
+removing their application from a group leaves the file there.
 
 `appstack.json` is written atomically, retaining `appstack.json.bak`. Invalid or
 unsupported configurations produce an error and are not overwritten. To recover,
@@ -162,7 +179,9 @@ coordinates. Without it, the invocation captures the cursor position once.
 The resident dispatcher sleeps in the Windows message loop. It has no global
 mouse hook, polling loop, artificial delays, splash screen or loading overlay.
 Popup anchoring captures the invocation position once. Normal mouse movement
-does not reposition a popup.
+does not reposition a popup. The one exception to idle sleeping is an open popup
+without activation (a press outside it, or after a drop): it checks the mouse
+buttons every 50 ms until it closes or is activated again.
 
 For taskbar and Jump List launches, Windows supplies the source monitor. AppStack
 anchors the popup to its group button's accessible rectangle on that monitor,

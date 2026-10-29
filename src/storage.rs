@@ -9,6 +9,8 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 const MAX_CONFIG: u64 = 16 * 1024 * 1024;
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
+/// Data folder holding the shortcut files that drops on a popup moved out of their folders.
+pub const ITEMS: &str = "items";
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -155,6 +157,11 @@ impl Store {
                 remap_asset(&mut group.appearance.icon, &extracted);
                 for entry in &mut group.entries {
                     remap_asset(&mut entry.icon, &extracted);
+                    if let Target::Application(path) = &mut entry.target {
+                        if path.starts_with(&format!("{ITEMS}/")) {
+                            remap_asset(path, &extracted);
+                        }
+                    }
                 }
             }
             Ok(())
@@ -210,7 +217,35 @@ impl Store {
             let options =
                 SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             let mut resources = HashMap::new();
+            let items = self.root.join(ITEMS).canonicalize().ok();
             for group in &mut portable.groups {
+                // Shortcuts moved into AppStack exist nowhere else, so the backup carries them.
+                for entry in &mut group.entries {
+                    let Target::Application(path) = &mut entry.target else {
+                        continue;
+                    };
+                    let source = PathBuf::from(&*path);
+                    let Some(relative) = items.as_ref().and_then(|items| {
+                        let canonical = source.canonicalize().ok()?;
+                        Some(canonical.strip_prefix(items).ok()?.to_path_buf())
+                    }) else {
+                        continue;
+                    };
+                    if !source.is_file() {
+                        continue;
+                    }
+                    if let Some(name) = resources.get(&source) {
+                        *path = String::clone(name);
+                        continue;
+                    }
+                    let name = format!("{ITEMS}/{}", relative.to_string_lossy().replace('\\', "/"));
+                    archive.start_file(&name, options).map_err(error)?;
+                    archive
+                        .write_all(&read_limited(&source, MAX_CONFIG)?)
+                        .map_err(error)?;
+                    resources.insert(source, name.clone());
+                    *path = name;
+                }
                 for icon in std::iter::once(&mut group.appearance.icon)
                     .chain(group.entries.iter_mut().map(|entry| &mut entry.icon))
                 {
@@ -533,6 +568,42 @@ mod tests {
         store.export(&config, &archive).unwrap();
         let groups = store.import(&archive).unwrap();
         assert_eq!(fs::read(&groups[0].appearance.icon).unwrap(), b"icon bytes");
+        fs::remove_dir_all(store.root).unwrap();
+    }
+
+    #[test]
+    fn archive_round_trip_carries_shortcuts_moved_into_items() {
+        let store = temporary();
+        fs::create_dir_all(store.root.join(ITEMS)).unwrap();
+        let moved = store.root.join(ITEMS).join("Editor.lnk");
+        fs::write(&moved, b"shortcut bytes").unwrap();
+        let elsewhere = store.root.join("Elsewhere.lnk");
+        fs::write(&elsewhere, b"other").unwrap();
+        let entry = |path: &Path| Entry {
+            name: "Editor".into(),
+            target: Target::Application(path.to_string_lossy().into_owned()),
+            ..Entry::default()
+        };
+        let group = Group {
+            entries: vec![entry(&moved), entry(&elsewhere)],
+            ..Group::default()
+        };
+        let config = Config {
+            groups: vec![group],
+            ..Config::default()
+        };
+        let archive = store.root.join("backup.agz");
+        store.export(&config, &archive).unwrap();
+        let groups = store.import(&archive).unwrap();
+        let Target::Application(restored) = &groups[0].entries[0].target else {
+            panic!("expected an application");
+        };
+        assert_ne!(Path::new(restored), moved);
+        assert_eq!(fs::read(restored).unwrap(), b"shortcut bytes");
+        assert_eq!(
+            groups[0].entries[1].target,
+            config.groups[0].entries[1].target
+        );
         fs::remove_dir_all(store.root).unwrap();
     }
 
