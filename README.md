@@ -49,6 +49,14 @@ redistributable. `cargo classic` is a plain Cargo shortcut for a release build.
 Installers need NSIS (`makensis`) on `PATH`; without it the packager only
 produces the portable executable.
 
+## Icons
+
+Buttons and context menus use [Lucide](https://lucide.dev) icons from `icons/`.
+`build.rs` renders each SVG into alpha masks at 16-48 pixels, and AppStack tints
+them with the current theme's text color, so they follow light, dark and high
+contrast themes and stay sharp at every scaling. To add one, drop its SVG from
+lucide-static into `icons/` and use its generated `ui::lucide` constant.
+
 ## Logo
 
 Edit `appstack.svg`, then rebuild. `build.rs` watches it and embeds 16,
@@ -74,6 +82,10 @@ after rebuilding; Explorer may retain its own icon cache until it refreshes.
   apply, and entries in any group that pointed at a moved shortcut follow it. The
   popup stays open while a mouse button is held outside it, so an icon can be
   picked up and dropped on it; a press outside that ends without a drop closes it.
+- Right-click the tray icon to open any group straight away, or for **Open
+  AppStack**, **New group**, **Preferences** and **Check for updates**; a group's
+  own tray icon offers **Open**, **Edit group** and **Launch all**. Tray and context
+  menus show icons, follow the manager theme and open away from the taskbar.
 - Right-click a popup for **Edit group** (the folder shown) and **New group**.
   The manager's group list and the tray menu also offer **New group**; in the
   group list, empty space offers only that.
@@ -85,8 +97,13 @@ after rebuilding; Explorer may retain its own icon cache until it refreshes.
   **Mosaic**, a grid that alternates large and small icons), columns, icon
   labels on/off, label position and size, headers, compact/card spacing, accent
   colors and per-group tray icons.
-- The group editor separates **General** settings from **Interface** settings.
-  Interface uses fixed size selects (`xs`, `sm`, `md`, `lg`, `xl`, `2xl`, `3xl`)
+- The group editor has five tabs: **General** (name, icon, order, tray),
+  **Style** (popup style, layout, rounding, border, colors, shadow), **Layout**
+  (columns, width, gaps, padding, scrolling), **Icons and labels** and **Header
+  and buttons**. Related settings sit side by side, and a setting that only
+  applies while a box is checked (label options, header position, visible rows,
+  button placement) is greyed out until it is.
+  Sizes use fixed selects (`xs`, `sm`, `md`, `lg`, `xl`, `2xl`, `3xl`)
   rather than arbitrary pixel inputs. Spacing follows a four-pixel scale; icon,
   text and width presets have their own appropriate scales. Width also has
   `auto`, spacing has `none`, and rounding follows Tailwind-style tokens from
@@ -98,16 +115,17 @@ after rebuilding; Explorer may retain its own icon cache until it refreshes.
   Accent and border colors are typed as `#RRGGBB` or picked from the Windows
   color picker beside each field; empty follows the theme.
   Sizes follow monitor DPI and the popup remains constrained to the work area.
-- **Popup style** at the top of Interface fills in every Interface setting with a
-  ready-made look (Dock, Bubble, List, Cards, Launchpad, Minimal, Indigo or
-  Sunset), which can then be adjusted before **Save**.
+- **Popup style** at the top of the Style tab fills in every look setting, on all
+  tabs, with a ready-made look (Dock, Bubble, List, Cards, Launchpad, Minimal,
+  Indigo or Sunset), which can then be adjusted before **Save**.
 - A live preview beside the settings shows the group's labels, icons, spacing,
   actions and rounding as controls change. Icons load asynchronously using the
   existing workers. Preview changes are not persisted until **Save**; **Cancel**
   leaves the configuration untouched. Existing custom numeric settings still
   load; editing presents the nearest standard preset and only Save applies it.
-- Each group chooses whether its popup shows the **Edit** and **Launch all**
-  buttons and whether they sit at the top or the bottom (sharing the title row
+- Each group chooses whether its popup shows the **Edit** (gear) and **Launch
+  all** (open) icon buttons, flat ghost buttons like the back button in subfolders
+  with a tooltip each, and whether they sit at the top or the bottom (sharing the title row
   when both are on the same side). Left, center and right alignment apply to
   the visible action group, including when only one button is enabled.
 - **Scroll inside the group** limits the popup to a number of visible rows and
@@ -119,12 +137,18 @@ after rebuilding; Explorer may retain its own icon cache until it refreshes.
   rows it needs. Edit and Launch all act on the folder shown.
 - Long names are truncated on one line with an ellipsis, like CSS
   `text-overflow: ellipsis`; the full name appears as a tooltip.
-- Preferences choose the folder title font and the icon label font. Space Grotesk
+- Preferences has a **General** tab (startup, tray, updates, Launch all and
+  popup behaviour) and an **Appearance** tab (themes, fonts, animations, cursor).
+  **Font theme** there sets both fonts at once from pairs that come with Windows
+  (Windows 11's Segoe UI Variable, Segoe UI, Bahnschrift, Cambria and Calibri,
+  Candara and Corbel, Georgia and Verdana, Sitka, Trebuchet MS and Tahoma, Cascadia
+  Code, Consolas) or AppStack's own; only pairs installed on the PC are listed, and
+  both fonts can still be changed after. It chooses the folder title font and the icon label font. Space Grotesk
   (titles) and Inter (labels) are embedded and are the defaults; any installed font
   can be selected. **Hand cursor on clickable popup items** (on by default) shows
   the hand over applications, buttons and page dots, like CSS `cursor: pointer`.
-  **Popup animations** fades each popup in as it rises a few pixels and pops its
-  icons in one after another.
+  **Popup animations** (on by default) fades each popup in as it rises a few
+  pixels and pops its icons in one after another.
 - Main and popup themes are independent, including dark buttons, scroll bars,
   lists, dialogs and context menus. High contrast takes precedence over custom
   colors. The manager's menu bar stays light because Win32 does not theme it.
@@ -215,10 +239,15 @@ requested popup's first paint, rather than competing with it.
 Popups use one native ListView rather than a window per application, painted by
 AppStack itself (custom draw), so hover only repaints the two cells that change.
 Up to four previously opened popups are reused; the editor is created on demand.
-Silent startup prepares up to four pinned groups with at most 32 entries without
-showing their popups, reusing the same bounded window cache. This moves work to
-resident preparation; it does not eliminate startup work. The small forwarding
-process delay-loads COM, Shell, themes and controls until they are actually used.
+Silent startup prepares up to four groups with at most 32 entries, pinned or not,
+without showing their popups, reusing the same bounded window cache; their edge
+(border and shadow) is drawn then too. This moves work to resident preparation; it
+does not eliminate startup work. Larger groups and groups beyond the first four
+are built on their first opening. A reopened popup keeps its edge bitmap: the
+layered edge window is only redrawn when the popup's size, colors or DPI change.
+The small forwarding process statically loads only kernel32, user32 and gdi32;
+COM, Shell, themes, controls, common dialogs, AlphaBlend and WinHTTP are
+delay-loaded until they are actually used.
 Reopening checks that cache before copying or sorting application entries.
 Showing a popup flushes pending paint without invalidating the entire window.
 Folder changes freeze painting until the new layout is final, then repaint once.
@@ -227,6 +256,12 @@ are capped at 256 entries; persistent cache maintenance targets 1,024 icons / 64
 MiB. On a first cache miss, a stable fallback icon is used without delaying input.
 Repeated icons share a native image-list entry within each popup, so a completed
 icon load updates one image instead of copying it into every matching cell.
+
+Setting `APPSTACK_STARTUP_TRACE` to a file path traces where each opening's time
+goes, in microseconds of the shared system clock so the two processes line up:
+`<path>.forward.jsonl` gets the forwarding process (creation, entry, each start-up
+stage, forwarded) and `<path>.popups.jsonl` the resident (request received, built or
+reused, shown, painted, focused, ready), one line per opening.
 
 The performance harness now defaults to eight applications with distinct real
 Windows executable targets. It invokes `.lnk` files through `ShellExecuteEx`,

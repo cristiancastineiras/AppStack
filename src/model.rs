@@ -138,7 +138,7 @@ impl Default for Settings {
             launch_all_enabled: true,
             grayscale_shortcuts: false,
             close_after_launch: true,
-            animations: false,
+            animations: true,
             pointer_cursor: true,
             check_updates: true,
             title_font: TITLE_FONT.into(),

@@ -4,17 +4,18 @@ use std::{
 };
 
 fn main() {
-    for path in ["app.manifest", "build.rs", "appstack.svg"] {
+    for path in ["app.manifest", "build.rs", "appstack.svg", "icons"] {
         println!("cargo:rerun-if-changed={path}");
     }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    lucide(&PathBuf::from(env::var_os("OUT_DIR").unwrap()));
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rustc-link-arg-bin=AppStackClassic=delayimp.lib");
         for library in [
             "combase", "ole32", "oleaut32", "advapi32", "dwmapi", "comctl32", "uxtheme", "shell32",
-            "winhttp",
+            "winhttp", "comdlg32", "msimg32",
         ] {
             println!("cargo:rustc-link-arg-bin=AppStackClassic=/DELAYLOAD:{library}.dll");
         }
@@ -101,4 +102,43 @@ END
             .manifest_required()
             .expect("compile binary resources");
     }
+}
+
+/// Renders icons/*.svg (Lucide) into alpha masks at the pixel sizes buttons and menus use at
+/// 100-300% scaling; the app tints them with the theme's text color. lucide.rs names each icon.
+fn lucide(output: &Path) {
+    const SIZES: [u32; 8] = [16, 20, 24, 28, 32, 36, 40, 48];
+    let mut paths: Vec<PathBuf> = fs::read_dir("icons")
+        .expect("read icons")
+        .map(|entry| entry.expect("read icon entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "svg"))
+        .collect();
+    paths.sort();
+    let (mut masks, mut names) = (Vec::new(), String::new());
+    for (index, path) in paths.iter().enumerate() {
+        let source = fs::read(path).expect("read icon");
+        let tree = resvg::usvg::Tree::from_data(&source, &resvg::usvg::Options::default())
+            .expect("parse icon");
+        for size in SIZES {
+            let mut pixels = resvg::tiny_skia::Pixmap::new(size, size).expect("allocate icon");
+            let scale = size as f32 / tree.size().width();
+            let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+            resvg::render(&tree, transform, &mut pixels.as_mut());
+            masks.extend(pixels.data().chunks_exact(4).map(|pixel| pixel[3]));
+        }
+        let stem = path.file_stem().unwrap().to_string_lossy();
+        names += &format!(
+            "pub const {}: usize = {index};\n",
+            stem.to_uppercase().replace('-', "_")
+        );
+    }
+    fs::write(output.join("lucide.bin"), masks).expect("write icon masks");
+    fs::write(
+        output.join("lucide.rs"),
+        format!(
+            "pub const SIZES: [i32; {}] = {SIZES:?};\n{names}",
+            SIZES.len()
+        ),
+    )
+    .expect("write icon names");
 }

@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
         $directory = Join-Path 'dist' 'installer-files'
         Remove-Item $directory -Recurse -Force -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force -Path $directory | Out-Null
-        Copy-Item $executable,'README.md','LICENSE','THIRD-PARTY-NOTICES.md','fonts\Inter-OFL.txt','fonts\SpaceGrotesk-OFL.txt' $directory -Force
+        Copy-Item $executable,'README.md','LICENSE','THIRD-PARTY-NOTICES.md','fonts\Inter-OFL.txt','fonts\SpaceGrotesk-OFL.txt','icons\Lucide-LICENSE.txt' $directory -Force
         $nsis = Get-Command makensis -ErrorAction SilentlyContinue
         if ($nsis) {
             $icon = Get-ChildItem 'target\release\build\appstack-*\out' -Filter ($binary + '.ico') -Recurse |

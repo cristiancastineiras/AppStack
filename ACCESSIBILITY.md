@@ -23,8 +23,8 @@ tell us about barriers.
   precedence over AppStack's themes and custom colors.
 - **Text:** names cut short with an ellipsis show their full text in a tooltip.
   Title and label fonts can be changed in **Preferences**.
-- **Motion:** popup animations are off by default and can be turned on or off in
-  **Preferences > Popup animations**.
+- **Motion:** popup animations are short (under a third of a second) and can be
+  turned off in **Preferences > Popup animations**.
 
 ## Known limitations
 

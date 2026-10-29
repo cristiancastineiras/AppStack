@@ -55,13 +55,19 @@ thread_local! {
     static LOOKS: RefCell<HashMap<usize, Look>> = RefCell::new(HashMap::new());
     static PAGERS: RefCell<HashMap<usize, Pager>> = RefCell::new(HashMap::new());
     // Edge windows and the popup frame each one draws.
-    static EDGES: RefCell<HashMap<usize, (Frame, u8)>> = RefCell::new(HashMap::new());
+    static EDGES: RefCell<HashMap<usize, Edge>> = RefCell::new(HashMap::new());
     // Opening popups: start, resting position and icon list.
     static POPS: RefCell<HashMap<usize, (std::time::Instant, POINT, HWND)>> = RefCell::new(HashMap::new());
     // Hand cursor over clickable popup items, like CSS `cursor: pointer`.
     static POINTER: Cell<bool> = const { Cell::new(false) };
     // Ghost buttons: hovered flag and the icon-font glyph each one draws.
-    static GHOSTS: RefCell<HashMap<usize, (bool, u16)>> = RefCell::new(HashMap::new());
+    static GHOSTS: RefCell<HashMap<usize, (bool, usize)>> = RefCell::new(HashMap::new());
+    /// Push buttons and the `lucide` icon apply_theme tints for them.
+    static BUTTON_ICONS: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+    /// Whether menus are dark, for the color of their icons.
+    static MENU_DARK: Cell<bool> = const { Cell::new(false) };
+    /// When the last forwarded request arrived, in `epoch_us`, for APPSTACK_STARTUP_TRACE.
+    static RECEIVED: Cell<u128> = const { Cell::new(0) };
     // Icon lists act on the first click; this remembers it so the double-click is not acted on again.
     static LAST_CLICK: Cell<Option<(usize, std::time::Instant)>> = const { Cell::new(None) };
     // Closed-hand drag cursor and the cursor size it was built for.
@@ -281,6 +287,7 @@ pub unsafe extern "system" fn procedure(
             }
         }
         WM_COPYDATA if second.0 != 0 => {
+            RECEIVED.with(|received| received.set(epoch_us()));
             let data = &*(second.0 as *const COPYDATASTRUCT);
             if data.dwData != 0x41505354 || data.cbData > 16_384 || data.lpData.is_null() {
                 return LRESULT(0);
@@ -399,25 +406,204 @@ struct Pager {
     dpi: u32,
 }
 
-/// Segoe Fluent Icons' "Back" glyph; Windows 10 has the same code point in Segoe MDL2 Assets.
-pub const BACK_GLYPH: u16 = 0xE72B;
-
-/// The vector icon font Windows uses for its own command buttons.
-pub fn icon_font(dpi: u32, pixels: i32) -> Font {
-    let family = if windows_build() >= 22000 {
-        "Segoe Fluent Icons"
-    } else {
-        "Segoe MDL2 Assets"
-    };
-    Font::with(dpi, pixels, family, 400)
+/// Microseconds since the Unix epoch from the precise system clock, which every process shares,
+/// so traces from the forwarding process and the resident line up.
+pub fn epoch_us() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_micros())
 }
 
-/// A flat icon button with no fill until it is hovered or pressed. `label` names it for screen
-/// readers; `glyph` is drawn with the button's icon font.
+/// When the last forwarded request arrived, in `epoch_us`.
+pub fn received_us() -> u128 {
+    RECEIVED.with(Cell::get)
+}
+
+/// Lucide icons (icons/*.svg), rendered by build.rs as alpha masks at several pixel sizes.
+#[allow(dead_code)]
+pub mod lucide {
+    include!(concat!(env!("OUT_DIR"), "/lucide.rs"));
+}
+static LUCIDE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lucide.bin"));
+
+/// An icon tinted with `color` (a COLORREF) at the smallest rendered size covering `size`:
+/// premultiplied for AlphaBlend and menus, straight for icon handles.
+fn lucide_pixels(icon: usize, size: i32, color: u32, premultiply: bool) -> (i32, Vec<u32>) {
+    let area = |side: &i32| (side * side) as usize;
+    let chosen = lucide::SIZES
+        .iter()
+        .position(|side| *side >= size)
+        .unwrap_or(lucide::SIZES.len() - 1);
+    let side = lucide::SIZES[chosen];
+    let start = icon * lucide::SIZES.iter().map(area).sum::<usize>()
+        + lucide::SIZES[..chosen].iter().map(area).sum::<usize>();
+    let channels = [color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF];
+    let pixels = LUCIDE[start..start + area(&side)]
+        .iter()
+        .map(|alpha| {
+            let alpha = u32::from(*alpha);
+            let [red, green, blue] = channels.map(|channel| {
+                if premultiply {
+                    channel * alpha / 255
+                } else {
+                    channel
+                }
+            });
+            (alpha << 24) | (red << 16) | (green << 8) | blue
+        })
+        .collect();
+    (side, pixels)
+}
+
+/// Draws an icon centered in `bounds`.
+pub unsafe fn draw_lucide(dc: HDC, icon: usize, bounds: RECT, size: i32, color: u32) {
+    let (side, pixels) = lucide_pixels(icon, size, color, true);
+    with_pixels(side, side, &pixels, |source| {
+        let _ = AlphaBlend(
+            dc,
+            bounds.left + (bounds.right - bounds.left - side) / 2,
+            bounds.top + (bounds.bottom - bounds.top - side) / 2,
+            side,
+            side,
+            source,
+            0,
+            0,
+            side,
+            side,
+            premultiplied(255),
+        );
+    });
+}
+
+/// A top-down 32-bit bitmap holding `pixels`.
+unsafe fn dib(width: i32, height: i32, pixels: &[u32]) -> HBITMAP {
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let bitmap =
+        CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+    if !bits.is_null() {
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u32>(), pixels.len());
+    }
+    bitmap
+}
+
+/// Shows `icon` beside a menu item in the menu theme's text color, and returns its bitmap for
+/// the caller to delete once the menu is gone. (Owner-drawn callback icons would turn a light
+/// menu dark.)
+pub fn menu_icon(menu: HMENU, id: u16, icon: usize, dpi: u32) -> HBITMAP {
+    let color = if high_contrast() {
+        unsafe { GetSysColor(COLOR_MENUTEXT) }
+    } else if MENU_DARK.with(Cell::get) {
+        0x00F3F3F3
+    } else {
+        0x001A1A1A
+    };
+    let (side, pixels) = lucide_pixels(icon, scale(16, dpi), color, true);
+    unsafe {
+        let bitmap = dib(side, side, &pixels);
+        let _ = SetMenuItemInfoW(
+            menu,
+            u32::from(id),
+            false,
+            &MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_BITMAP,
+                hbmpItem: bitmap,
+                ..Default::default()
+            },
+        );
+        bitmap
+    }
+}
+
+/// Shows `icon` beside a push button's text. apply_theme tints it with the window's text color.
+pub fn button_icon(button: HWND, icon: usize) {
+    BUTTON_ICONS.with_borrow_mut(|icons| icons.insert(button.0 as usize, icon));
+    unsafe {
+        let _ = SetWindowSubclass(button, Some(button_procedure), 2, 0);
+        tint_button(button, icon);
+    }
+}
+
+unsafe fn tint_button(button: HWND, icon: usize) {
+    let color = GetParent(button)
+        .ok()
+        .and_then(|parent| COLORS.with_borrow(|colors| colors.get(&(parent.0 as usize)).copied()))
+        .map_or(GetSysColor(COLOR_BTNTEXT), |(_, foreground)| foreground);
+    let dpi = GetDpiForWindow(button);
+    let (side, pixels) = lucide_pixels(icon, scale(16, dpi), color, false);
+    // Transparent columns on the right keep the button's text clear of the icon.
+    let width = side + scale(5, dpi);
+    let mut padded = vec![0u32; (width * side) as usize];
+    for (row, line) in pixels.chunks_exact(side as usize).enumerate() {
+        padded[row * width as usize..][..side as usize].copy_from_slice(line);
+    }
+    let image = dib(width, side, &padded);
+    let mask = CreateBitmap(width, side, 1, 1, None);
+    let handle = CreateIconIndirect(&ICONINFO {
+        fIcon: true.into(),
+        hbmMask: mask,
+        hbmColor: image,
+        ..Default::default()
+    });
+    let _ = DeleteObject(image.into());
+    let _ = DeleteObject(mask.into());
+    if let Ok(handle) = handle {
+        let previous = send(
+            button,
+            BM_SETIMAGE,
+            WPARAM(IMAGE_ICON.0 as usize),
+            LPARAM(handle.0 as isize),
+        );
+        if previous.0 != 0 {
+            let _ = DestroyIcon(HICON(previous.0 as *mut _));
+        }
+    }
+}
+
+/// Forgets an icon or ghost button, and frees its icon, when it is destroyed.
+unsafe extern "system" fn button_procedure(
+    window: HWND,
+    code: u32,
+    first: WPARAM,
+    second: LPARAM,
+    identifier: usize,
+    _: usize,
+) -> LRESULT {
+    if code == WM_NCDESTROY {
+        BUTTON_ICONS.with_borrow_mut(|icons| icons.remove(&(window.0 as usize)));
+        GHOSTS.with_borrow_mut(|ghosts| ghosts.remove(&(window.0 as usize)));
+        let image = send(
+            window,
+            BM_GETIMAGE,
+            WPARAM(IMAGE_ICON.0 as usize),
+            LPARAM(0),
+        );
+        if image.0 != 0 {
+            let _ = DestroyIcon(HICON(image.0 as *mut _));
+        }
+        let _ = RemoveWindowSubclass(window, Some(button_procedure), identifier);
+    }
+    DefSubclassProc(window, code, first, second)
+}
+
+/// A flat icon button with no fill until it is hovered or pressed, like a ghost button.
+/// `label` names it for screen readers and its tooltip; `icon` is a `lucide` icon.
 pub fn ghost_button(
     parent: HWND,
     label: &str,
-    glyph: u16,
+    icon: usize,
     id: u16,
     font: &Font,
 ) -> Result<HWND, String> {
@@ -429,12 +615,54 @@ pub fn ghost_button(
         WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
         font,
     )?;
-    GHOSTS.with_borrow_mut(|ghosts| ghosts.insert(button.0 as usize, (false, glyph)));
+    GHOSTS.with_borrow_mut(|ghosts| ghosts.insert(button.0 as usize, (false, icon)));
+    unsafe {
+        let _ = SetWindowSubclass(button, Some(button_procedure), 2, 0);
+    }
+    tooltip(parent, button, label);
     Ok(button)
 }
 
-pub fn forget_ghost(button: HWND) {
-    GHOSTS.with_borrow_mut(|ghosts| ghosts.remove(&(button.0 as usize)));
+/// A tooltip naming a control, for icon-only buttons. A window's controls share one tooltip.
+pub fn tooltip(parent: HWND, control: HWND, text: &str) {
+    unsafe {
+        let mut tip = HWND(GetPropW(parent, w!("AppStack.Tooltip")).0);
+        if tip.is_invalid() {
+            let Ok(created) = CreateWindowExW(
+                WS_EX_TOPMOST,
+                TOOLTIPS_CLASSW,
+                None,
+                WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                Some(parent),
+                None,
+                None,
+                None,
+            ) else {
+                return;
+            };
+            let _ = SetPropW(parent, w!("AppStack.Tooltip"), Some(HANDLE(created.0)));
+            tip = created;
+        }
+        let mut text = wide(text);
+        let tool = TTTOOLINFOW {
+            cbSize: size_of::<TTTOOLINFOW>() as u32,
+            uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+            hwnd: parent,
+            uId: control.0 as usize,
+            lpszText: PWSTR(text.as_mut_ptr()),
+            ..Default::default()
+        };
+        send(
+            tip,
+            TTM_ADDTOOLW,
+            WPARAM(0),
+            LPARAM(&tool as *const _ as isize),
+        );
+    }
 }
 
 /// Owner-drawn buttons get no hover state from Windows, so the message loop reports it here.
@@ -464,7 +692,7 @@ pub fn track_ghost(button: HWND, inside: bool) -> bool {
     true
 }
 
-unsafe fn paint_ghost(parent: HWND, item: &DRAWITEMSTRUCT, (hot, glyph): (bool, u16)) {
+unsafe fn paint_ghost(parent: HWND, item: &DRAWITEMSTRUCT, (hot, icon): (bool, usize)) {
     let (background, foreground) = COLORS
         .with_borrow(|colors| colors.get(&(parent.0 as usize)).copied())
         .unwrap_or((GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOWTEXT)));
@@ -505,24 +733,12 @@ unsafe fn paint_ghost(parent: HWND, item: &DRAWITEMSTRUCT, (hot, glyph): (bool, 
         SelectObject(dc, brush);
         SelectObject(dc, pen);
     }
-    let font = SelectObject(
-        dc,
-        HGDIOBJ(send(item.hwndItem, WM_GETFONT, WPARAM(0), LPARAM(0)).0 as *mut _),
-    );
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, COLORREF(foreground));
-    let mut text = [glyph];
-    let mut area = RECT {
+    let area = RECT {
         top: bounds.top + i32::from(pressed),
+        bottom: bounds.bottom + i32::from(pressed),
         ..bounds
     };
-    DrawTextW(
-        dc,
-        &mut text,
-        &mut area,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-    );
-    SelectObject(dc, font);
+    draw_lucide(dc, icon, area, scale(16, dpi), foreground);
 }
 
 pub fn set_pager(viewport: HWND, pager: Option<(i32, i32)>, strip: i32, dpi: u32) {
@@ -1117,6 +1333,15 @@ pub unsafe extern "system" fn edge_procedure(
     DefWindowProcW(window, code, first, second)
 }
 
+#[derive(Clone, Copy)]
+struct Edge {
+    frame: Frame,
+    opacity: u8,
+    /// Size, colors and DPI of the bitmap the window holds. A layered window keeps it while
+    /// hidden, so showing the same popup again only moves it.
+    drawn: Option<(i32, i32, (u32, u32), u32)>,
+}
+
 /// GDI regions cut stair-stepped corners and Win32 has no CSS border or shadow, so each popup
 /// owns a click-through layered window that paints its rim, border and shadow over it.
 unsafe fn attach_edge(popup: HWND, frame: Frame) -> bool {
@@ -1140,10 +1365,14 @@ unsafe fn attach_edge(popup: HWND, frame: Frame) -> bool {
         edge = created;
     }
     EDGES.with_borrow_mut(|edges| {
-        edges
-            .entry(edge.0 as usize)
-            .and_modify(|(stored, _)| *stored = frame)
-            .or_insert((frame, 255));
+        let stored = edges.entry(edge.0 as usize).or_insert(Edge {
+            frame,
+            opacity: 255,
+            drawn: None,
+        });
+        if stored.frame != frame {
+            (stored.frame, stored.drawn) = (frame, None);
+        }
     });
     true
 }
@@ -1154,7 +1383,7 @@ unsafe fn set_edge_opacity(popup: HWND, opacity: u8) {
     let known = EDGES.with_borrow_mut(|edges| {
         edges
             .get_mut(&(edge.0 as usize))
-            .map(|(_, stored)| *stored = opacity)
+            .map(|stored| stored.opacity = opacity)
             .is_some()
     });
     if known && IsWindowVisible(edge).as_bool() {
@@ -1182,14 +1411,12 @@ unsafe fn sync_edge(popup: HWND, edge: HWND, flags: SET_WINDOW_POS_FLAGS) {
         && (flags.0 & SWP_SHOWWINDOW.0 != 0 || IsWindowVisible(edge).as_bool());
     let stored = EDGES.with_borrow(|edges| edges.get(&(edge.0 as usize)).copied());
     let mut bounds = RECT::default();
-    let (Some((frame, opacity)), true, Ok(())) =
-        (stored, visible, GetWindowRect(popup, &mut bounds))
-    else {
+    let (Some(stored), true, Ok(())) = (stored, visible, GetWindowRect(popup, &mut bounds)) else {
         let _ = ShowWindow(edge, SW_HIDE);
         return;
     };
     let dpi = GetDpiForWindow(popup).max(96);
-    let margin = shadow_margin(frame.shadow, dpi);
+    let margin = shadow_margin(stored.frame.shadow, dpi);
     // A move keeps the drawing, as when the opening animation lifts the popup.
     if !shown && flags.0 & SWP_NOSIZE.0 != 0 {
         let _ = SetWindowPos(
@@ -1203,20 +1430,66 @@ unsafe fn sync_edge(popup: HWND, edge: HWND, flags: SET_WINDOW_POS_FLAGS) {
         );
         return;
     }
+    let Some(origin) = draw_edge(popup, edge, stored) else {
+        let _ = ShowWindow(edge, SW_HIDE);
+        return;
+    };
+    let _ = SetWindowPos(
+        edge,
+        None,
+        origin.x,
+        origin.y,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    // A kept bitmap may carry the opacity of its last showing.
+    let _ = UpdateLayeredWindow(
+        edge,
+        None,
+        None,
+        None,
+        None,
+        None,
+        COLORREF(0),
+        Some(&premultiplied(stored.opacity)),
+        ULW_ALPHA,
+    );
+    let _ = ShowWindow(edge, SW_SHOWNA);
+}
+
+/// Gives the edge window the bitmap for its popup's size, colors and DPI unless it already holds
+/// that one, and returns where the window goes. Computing every shadow pixel is most of the cost
+/// of showing a popup, and a layered window keeps its bitmap while hidden.
+unsafe fn draw_edge(popup: HWND, edge: HWND, stored: Edge) -> Option<POINT> {
+    let mut bounds = RECT::default();
+    GetWindowRect(popup, &mut bounds).ok()?;
+    let dpi = GetDpiForWindow(popup).max(96);
+    let margin = shadow_margin(stored.frame.shadow, dpi);
     let colors = COLORS
         .with_borrow(|colors| colors.get(&(popup.0 as usize)).copied())
         .unwrap_or((GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOWTEXT)));
     let width = bounds.right - bounds.left + margin * 2;
     let height = bounds.bottom - bounds.top + margin * 2;
-    let pixels = frame_pixels(width, height, margin, frame, colors, dpi, true);
+    let origin = POINT {
+        x: bounds.left - margin,
+        y: bounds.top - margin,
+    };
+    let key = (width, height, colors, dpi);
+    if stored.drawn == Some(key) {
+        return Some(origin);
+    }
+    EDGES.with_borrow_mut(|edges| {
+        if let Some(edge) = edges.get_mut(&(edge.0 as usize)) {
+            edge.drawn = Some(key);
+        }
+    });
+    let pixels = frame_pixels(width, height, margin, stored.frame, colors, dpi, true);
     with_pixels(width, height, &pixels, |source| {
         let _ = UpdateLayeredWindow(
             edge,
             None,
-            Some(&POINT {
-                x: bounds.left - margin,
-                y: bounds.top - margin,
-            }),
+            Some(&origin),
             Some(&SIZE {
                 cx: width,
                 cy: height,
@@ -1224,11 +1497,21 @@ unsafe fn sync_edge(popup: HWND, edge: HWND, flags: SET_WINDOW_POS_FLAGS) {
             Some(source),
             Some(&POINT::default()),
             COLORREF(0),
-            Some(&premultiplied(opacity)),
+            Some(&premultiplied(stored.opacity)),
             ULW_ALPHA,
         );
     });
-    let _ = ShowWindow(edge, SW_SHOWNA);
+    Some(origin)
+}
+
+/// Draws a hidden popup's edge ahead of its first showing, for popups prepared in advance.
+pub fn prepare_edge(popup: HWND) {
+    unsafe {
+        let edge = HWND(GetPropW(popup, w!("AppStack.Edge")).0);
+        if let Some(stored) = EDGES.with_borrow(|edges| edges.get(&(edge.0 as usize)).copied()) {
+            draw_edge(popup, edge, stored);
+        }
+    }
 }
 
 pub fn set_pointer(enabled: bool) {
@@ -1846,6 +2129,9 @@ unsafe extern "system" fn theme_child(child: HWND, dark: LPARAM) -> BOOL {
     if LOOKS.with_borrow(|looks| looks.contains_key(&(child.0 as usize))) {
         return BOOL(1);
     }
+    if let Some(icon) = BUTTON_ICONS.with_borrow(|icons| icons.get(&(child.0 as usize)).copied()) {
+        tint_button(child, icon);
+    }
     let mut class = [0u16; 32];
     let length = GetClassNameW(child, &mut class) as usize;
     let class = String::from_utf16_lossy(&class[..length]);
@@ -1890,11 +2176,13 @@ pub fn windows_build() -> u32 {
 /// Popup and context menus follow the manager theme where Windows supports it (1903+).
 pub fn set_menu_theme(theme: Theme) {
     let build = windows_build();
+    MENU_DARK.with(|dark| dark.set(build >= 18362 && is_dark(theme)));
     if build < 18362 {
         return;
     }
     unsafe {
-        let Ok(module) = GetModuleHandleW(w!("uxtheme.dll")) else {
+        // Loaded, not looked up: uxtheme is delay-loaded, so a tray-only start may not have it yet.
+        let Ok(module) = LoadLibraryW(w!("uxtheme.dll")) else {
             return;
         };
         // Undocumented uxtheme ordinals: 135 SetPreferredAppMode, 136 FlushMenuThemes.
@@ -1935,6 +2223,8 @@ pub enum Field {
     Check {
         label: String,
         value: bool,
+        /// Fields, by label, that only matter while this box is checked.
+        enables: Vec<String>,
     },
     Choice {
         label: String,
@@ -2006,7 +2296,16 @@ impl Field {
         Self::Check {
             label: label.into(),
             value,
+            enables: Vec::new(),
         }
+    }
+    /// Greys out the named fields while this box is unchecked. A field named by several
+    /// boxes stays available while any of them is checked.
+    pub fn enabling(mut self, labels: &[&str]) -> Self {
+        if let Self::Check { enables, .. } = &mut self {
+            *enables = labels.iter().map(|label| label.to_string()).collect();
+        }
+        self
     }
     pub fn choice(label: &str, values: &[&str], selected: usize) -> Self {
         Self::Choice {
@@ -2103,11 +2402,11 @@ unsafe fn paint_group_preview(window: HWND, item: &DRAWITEMSTRUCT, preview: &Gro
     let bottom_band = header_band == Some(true) || button_band == Some(true);
     let shared = show_buttons && header_band == button_band;
     let title_font = Font::with(96, look.label_size as i32 + 4, &settings.title_font, 600);
-    let action_font = Font::new(96, 13);
-    let action_widths: Vec<_> = [(look.show_edit_button, "Edit"), (show_all, "Launch all")]
+    // The popup's square icon buttons.
+    let action_widths: Vec<_> = [look.show_edit_button, show_all]
         .into_iter()
-        .filter(|(show, _)| *show)
-        .map(|(_, name)| text_width(&action_font, name) + 24)
+        .filter(|show| *show)
+        .map(|_| 30)
         .collect();
     let actions_width =
         action_widths.iter().sum::<i32>() + 6 * action_widths.len().saturating_sub(1) as i32;
@@ -2160,7 +2459,6 @@ unsafe fn paint_group_preview(window: HWND, item: &DRAWITEMSTRUCT, preview: &Gro
     let dpi = (zoom * 96.0).round().max(24.0) as u32;
     let font = Font::with(dpi, look.label_size as i32 + 1, &settings.label_font, 400);
     let title_font = Font::with(dpi, look.label_size as i32 + 4, &settings.title_font, 600);
-    let button_font = Font::new(dpi, 13);
     let heading_font = Font::new(GetDpiForWindow(window).max(96), 14);
     preview_text(
         dc,
@@ -2340,12 +2638,14 @@ unsafe fn paint_group_preview(window: HWND, item: &DRAWITEMSTRUCT, preview: &Gro
                 title_right = *first - pixels(6);
             }
         }
-        for (((_, label), button_width), position) in
-            [(look.show_edit_button, "Edit"), (show_all, "Launch all")]
-                .into_iter()
-                .filter(|(show, _)| *show)
-                .zip(widths)
-                .zip(positions)
+        for (((_, icon), button_width), position) in [
+            (look.show_edit_button, lucide::SETTINGS),
+            (show_all, lucide::SQUARE_ARROW_OUT_UP_RIGHT),
+        ]
+        .into_iter()
+        .filter(|(show, _)| *show)
+        .zip(widths)
+        .zip(positions)
         {
             let bounds = RECT {
                 left: position,
@@ -2353,21 +2653,7 @@ unsafe fn paint_group_preview(window: HWND, item: &DRAWITEMSTRUCT, preview: &Gro
                 right: position + button_width,
                 bottom: band_top(bottom) + pixels(35),
             };
-            preview_shape(
-                dc,
-                bounds,
-                pixels(4),
-                background,
-                blend(background, foreground, 24),
-            );
-            preview_text(
-                dc,
-                label,
-                bounds,
-                &button_font,
-                foreground,
-                DT_CENTER | DT_VCENTER,
-            );
+            draw_lucide(dc, icon, bounds, pixels(16), foreground);
         }
     }
     if let Some(bottom) = header_band {
@@ -2628,6 +2914,22 @@ unsafe extern "system" fn form_procedure(
         }
     }
     if let Some(result) = paint_colors(window, code, first) {
+        // A disabled field's label dims with it; Windows' own disabled text is etched.
+        let id = GetDlgCtrlID(HWND(second.0 as *mut _));
+        if code == WM_CTLCOLORSTATIC
+            && id > i32::from(LABEL)
+            && GetDlgItem(Some(window), id - i32::from(LABEL))
+                .is_ok_and(|control| !IsWindowEnabled(control).as_bool())
+        {
+            if let Some((background, foreground)) =
+                COLORS.with_borrow(|colors| colors.get(&(window.0 as usize)).copied())
+            {
+                SetTextColor(
+                    HDC(first.0 as *mut _),
+                    COLORREF(blend(background, foreground, 45)),
+                );
+            }
+        }
         return result;
     }
     DefWindowProcW(window, code, first, second)
@@ -2635,6 +2937,36 @@ unsafe extern "system" fn form_procedure(
 
 /// Added to a color field's control id for its swatch button.
 const SWATCH: u16 = 900;
+/// Added to a field's control id for the label above it.
+const LABEL: u16 = 2000;
+
+/// Applies each checkbox's `enables` to the fields it names. Labels stay enabled and are
+/// repainted, so form_procedure can dim them in the theme's colors.
+unsafe fn update_enabled(window: HWND, fields: &[Field], controls: &[Option<HWND>]) {
+    let mut wanted = HashMap::<&str, bool>::new();
+    for (field, control) in fields.iter().zip(controls) {
+        if let (Field::Check { enables, .. }, Some(control)) = (field, control) {
+            let checked = send(*control, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1;
+            for label in enables {
+                *wanted.entry(label).or_default() |= checked;
+            }
+        }
+    }
+    for (index, (field, control)) in fields.iter().zip(controls).enumerate() {
+        if let (Some(&enabled), Some(control)) = (wanted.get(field.label()), control) {
+            if IsWindowEnabled(*control).as_bool() != enabled {
+                let _ = EnableWindow(*control, enabled);
+                let id = 100 + index as u16;
+                if let Ok(swatch) = GetDlgItem(Some(window), (id + SWATCH).into()) {
+                    let _ = EnableWindow(swatch, enabled);
+                }
+                if let Ok(label) = GetDlgItem(Some(window), (id + LABEL).into()) {
+                    let _ = InvalidateRect(Some(label), None, true);
+                }
+            }
+        }
+    }
+}
 
 /// A color field's swatch: the chosen color, or "Auto" while the field is empty.
 unsafe fn paint_swatch(window: HWND, item: &DRAWITEMSTRUCT) {
@@ -3012,8 +3344,13 @@ pub fn form_with_preview(
             dpi,
         )
         .min(area.right - area.left - scale(24, dpi));
+        // Short pages still leave the preview room for a tall popup.
         let height = scale(
-            rows as i32 * row_height + if paged { 144 } else { 100 },
+            (rows as i32 * row_height + if paged { 144 } else { 100 }).max(if has_preview {
+                600
+            } else {
+                0
+            }),
             dpi,
         )
         .min(area.bottom - area.top - scale(24, dpi));
@@ -3048,6 +3385,12 @@ pub fn form_with_preview(
         };
         if paged {
             let tab = child(window, WC_TABCONTROLW, "", 40, WS_TABSTOP, &font)?;
+            send(
+                tab,
+                TCM_SETPADDING,
+                WPARAM(0),
+                LPARAM(((scale(14, dpi) & 0xFFFF) | (scale(3, dpi) << 16)) as isize),
+            );
             place(
                 tab,
                 scale(14, dpi),
@@ -3084,20 +3427,27 @@ pub fn form_with_preview(
                 controls.push(None);
                 continue;
             }
+            // Fields fill each row before the next, so related pairs sit side by side.
             let columns = page_columns[page];
-            let rows = page_counts[page].div_ceil(columns).max(1);
             let column_width = (fields_width - scale(36, dpi)) / columns as i32;
             let offset = offsets[page];
             offsets[page] += 1;
-            let left = scale(14, dpi) + (offset / rows) as i32 * column_width;
+            let left = scale(14, dpi) + (offset % columns) as i32 * column_width;
             let top = scale(
-                if paged { 58 } else { 12 } + (offset % rows) as i32 * row_height,
+                if paged { 58 } else { 12 } + (offset / columns) as i32 * row_height,
                 dpi,
             );
             let id = 100 + index as u16;
             let control = match field {
                 Field::Text { label, value } | Field::Color { label, value } => {
-                    let label = child(window, w!("STATIC"), label, 0, WINDOW_STYLE(0), &font)?;
+                    let label = child(
+                        window,
+                        w!("STATIC"),
+                        label,
+                        id + LABEL,
+                        WINDOW_STYLE(0),
+                        &font,
+                    )?;
                     pages[page].push(label);
                     place(
                         label,
@@ -3147,7 +3497,7 @@ pub fn form_with_preview(
                     }
                     control
                 }
-                Field::Check { label, value } => {
+                Field::Check { label, value, .. } => {
                     let control = child(
                         window,
                         w!("BUTTON"),
@@ -3169,7 +3519,14 @@ pub fn form_with_preview(
                 Field::Choice { label, values, .. }
                 | Field::Preset { label, values, .. }
                 | Field::Style { label, values, .. } => {
-                    let label = child(window, w!("STATIC"), label, 0, WINDOW_STYLE(0), &font)?;
+                    let label = child(
+                        window,
+                        w!("STATIC"),
+                        label,
+                        id + LABEL,
+                        WINDOW_STYLE(0),
+                        &font,
+                    )?;
                     pages[page].push(label);
                     place(
                         label,
@@ -3250,21 +3607,24 @@ pub fn form_with_preview(
             WS_TABSTOP,
             &font,
         )?;
+        button_icon(accept, lucide::CHECK);
+        button_icon(cancel, lucide::X);
         place(
             accept,
-            rectangle.right - scale(190, dpi),
+            rectangle.right - scale(210, dpi),
             rectangle.bottom - scale(44, dpi),
-            scale(80, dpi),
+            scale(92, dpi),
             scale(28, dpi),
         );
         place(
             cancel,
-            rectangle.right - scale(100, dpi),
+            rectangle.right - scale(108, dpi),
             rectangle.bottom - scale(44, dpi),
-            scale(80, dpi),
+            scale(92, dpi),
             scale(28, dpi),
         );
         apply_theme(window, theme, &[], None);
+        update_enabled(window, fields, &controls);
         if paged {
             state.pages.replace(pages);
             state.select_page(window, 0);
@@ -3296,6 +3656,7 @@ pub fn form_with_preview(
                 apply_style(fields, &controls, index);
                 state.preview_dirty.set(true);
             }
+            update_enabled(window, fields, &controls);
             if let Some(update) = live_preview.as_mut() {
                 let preview = state.preview.borrow_mut().take();
                 if let Some(mut preview) = preview {
@@ -3320,5 +3681,25 @@ pub fn form_with_preview(
             PostQuitMessage(code);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lucide_masks_line_up_with_their_names() {
+        let per_icon: usize = lucide::SIZES
+            .iter()
+            .map(|side| (side * side) as usize)
+            .sum();
+        assert_eq!(LUCIDE.len() % per_icon, 0);
+        // icons/x.svg sorts last, so its index is the last mask.
+        assert_eq!(lucide::X + 1, LUCIDE.len() / per_icon);
+        let (side, pixels) = lucide_pixels(lucide::CHECK, 17, 0x0000FF, false);
+        assert_eq!(side, 20, "the next rendered size up");
+        assert_eq!(pixels[0] >> 24, 0, "a check mark leaves its corner empty");
+        assert!(pixels.contains(&0xFFFF_0000), "opaque red strokes");
     }
 }

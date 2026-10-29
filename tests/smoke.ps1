@@ -177,6 +177,7 @@ public static class AppStackLayoutV4 {
         PostMessage(form,0x111,new IntPtr(id | 0x10000),control);
     }
     [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr window, int id);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr window);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] static extern int GetWindowRgn(IntPtr window, IntPtr region);
     [DllImport("gdi32.dll")] static extern IntPtr CreateRectRgn(int left, int top, int right, int bottom);
@@ -247,14 +248,20 @@ if ($EditorOnly) {
             foreach ($action in @('cancel','save')) {
                 [AppStackSmokeV2]::PostMessage($manager,0x111,[IntPtr]102,[IntPtr]::Zero) | Out-Null
                 $form = [AppStackSmokeV2]::WaitWindow('AppStack.Form','Edit group',$process.Id)
-                [AppStackLayoutV4]::SelectTab($form,'Interface')
-                [AppStackSmokeV2]::WaitFor([Func[bool]]{ return [AppStackSmokeV2]::IsWindowVisible([AppStackLayoutV4]::GetDlgItem($form,129)) },$process.Id,10000)
-                $preview = [AppStackLayoutV4]::GetDlgItem($form,50)
+                [AppStackLayoutV4]::SelectTab($form,'Layout')
+                [AppStackSmokeV2]::WaitFor([Func[bool]]{ return [AppStackSmokeV2]::IsWindowVisible([AppStackLayoutV4]::GetDlgItem($form,117)) },$process.Id,10000)
+                if ($action -eq 'cancel') {
+                    # Visible rows only applies while Scroll inside the group is checked.
+                    $rows = [AppStackLayoutV4]::GetDlgItem($form,123)
+                    if ([AppStackLayoutV4]::IsWindowEnabled($rows)) { throw 'Visible rows is enabled while scrolling is off' }
+                    [AppStackSmokeV2]::PostMessage([AppStackLayoutV4]::GetDlgItem($form,122),0xF5,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
+                    [AppStackSmokeV2]::WaitFor([Func[bool]]{ return [AppStackLayoutV4]::IsWindowEnabled($rows) },$process.Id,10000)
+                }                $preview = [AppStackLayoutV4]::GetDlgItem($form,50)
                 if ($preview -eq [IntPtr]::Zero) { throw 'Live preview is missing' }
                 $before = Join-Path $root ('preview-before-' + $action + '.png')
                 $after = Join-Path $root ('preview-after-' + $action + '.png')
                 [AppStackSmokeV2]::Screenshot($preview,$before)
-                foreach ($setting in @(@(109,'2xl'),@(110,'lg'),@(111,'md'),@(112,'xl'),@(113,'xl'),@(114,'full'),@(115,'full'),@(116,'Card'),@(129,'2xl'))) {
+                foreach ($setting in @(@(125,'2xl'),@(118,'lg'),@(119,'md'),@(120,'xl'),@(121,'xl'),@(109,'full'),@(110,'full'),@(108,'Card'),@(117,'2xl'))) {
                     Set-EditorPreset $form $setting[0] $setting[1] $process.Id
                 }
                 [AppStackSmokeV2]::Screenshot($preview,$after)
@@ -387,11 +394,11 @@ if ($EditorOnly) {
         [AppStackInput]::SetText($name,'Smoke created')
         $formElement = [System.Windows.Automation.AutomationElement]::FromHandle($form)
         $interface = $formElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
-            (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Interface')))
-        if ($null -eq $interface) { [AppStackLayoutV4]::SelectTab($form,'Interface') }
+            (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Layout')))
+        if ($null -eq $interface) { [AppStackLayoutV4]::SelectTab($form,'Layout') }
         else { ([System.Windows.Automation.SelectionItemPattern]$interface.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)).Select() }
-        [AppStackSmokeV2]::WaitFor([Func[bool]]{ return [AppStackSmokeV2]::IsWindowVisible([AppStackLayoutV4]::GetDlgItem($form,129)) },$process.Id,10000)
-        foreach ($setting in @(@(109,'2xl'),@(110,'lg'),@(111,'md'),@(112,'xl'),@(113,'xl'),@(114,'3xl'),@(115,'xl'),@(129,'2xl'))) {
+        [AppStackSmokeV2]::WaitFor([Func[bool]]{ return [AppStackSmokeV2]::IsWindowVisible([AppStackLayoutV4]::GetDlgItem($form,117)) },$process.Id,10000)
+        foreach ($setting in @(@(125,'2xl'),@(118,'lg'),@(119,'md'),@(120,'xl'),@(121,'xl'),@(109,'3xl'),@(110,'xl'),@(117,'2xl'))) {
             Set-EditorPreset $form $setting[0] $setting[1] $process.Id
         }
         foreach ($label in @('Save','Cancel')) {
@@ -470,7 +477,7 @@ if ($EditorOnly) {
         }
         Write-Output ('PASS: native UI, single instance, fixed popup, virtualization, scroll, subgroups, popup reuse, UI Automation, real launch, group creation, atomic persistence')
         Write-Output 'PASS: icons-only, right labels and card layouts retain accessible application names'
-        Write-Output 'PASS: General/Interface tabs, custom settings persistence, icon sizes, gaps, corner regions and single-button alignment'
+        Write-Output 'PASS: group editor tabs, custom settings persistence, icon sizes, gaps, corner regions and single-button alignment'
         Write-Output ('Diagnostic only: cold manager (1003 items)=' + $cold + 'ms; cold popup=' + $coldPopup + 'ms; first popup=' + $warm + 'ms; warm p95 (5 samples)=' + $p95 + 'ms; native buttons=' + $buttons + '; working set=' + $metrics.working_set_mib + 'MiB')
         Write-Output ('Screenshots: ' + $root)
     } catch {
