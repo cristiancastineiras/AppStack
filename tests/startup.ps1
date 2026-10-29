@@ -303,7 +303,7 @@ if (-not $PinnedShortcut -and -not $PSBoundParameters.ContainsKey('MoveCursor'))
         $path = $applicationPaths[($_ - 1) % $applicationPaths.Count]
         @{id=[guid]::NewGuid().ToString();name=[IO.Path]::GetFileNameWithoutExtension($path);target=@{kind='Application';value=$path}}
     })
-    $configuration = @{schema_version=2;settings=@{show_tray=$false};groups=@(@{id=$group;name=$title;appearance=@{columns=4;show_labels=$true};entries=$entries})}
+    $configuration = @{schema_version=2;settings=@{show_tray=$false;check_updates=$false};groups=@(@{id=$group;name=$title;appearance=@{columns=4;show_labels=$true};entries=$entries})}
     $profiles = @{}
     $shortcuts = @{}
     $silentShortcuts = @{}

@@ -1,6 +1,7 @@
 use super::{
     icons::{self, Icon, Spec},
     shell, ui,
+    update::{self, Release},
 };
 use appstack::{model::*, storage::Store};
 use std::{
@@ -19,6 +20,9 @@ pub enum Job {
     Synchronize(Config),
     EnsureBrand(Config),
     Startup(bool),
+    /// Whether the user asked, so an automatic check stays quiet unless it finds something.
+    CheckUpdate(bool),
+    Update(Release),
     Stop,
 }
 
@@ -34,6 +38,9 @@ pub enum Completed {
     },
     Error(String),
     Status(String),
+    Release(bool, Result<Option<Release>, String>),
+    /// The command that installs the downloaded update once AppStack has exited.
+    Updated(Result<std::process::Command, String>),
 }
 
 pub struct Background {
@@ -255,6 +262,25 @@ impl Background {
                         Ok(()) => Completed::Status(String::new()),
                         Err(error) => Completed::Error(error),
                     },
+                    // Network waits get their own thread so saves are never queued behind them.
+                    Job::CheckUpdate(manual) => {
+                        let sender = sender.clone();
+                        thread::spawn(move || {
+                            deliver(&sender, owner, Completed::Release(manual, update::latest()))
+                        });
+                        continue;
+                    }
+                    Job::Update(release) => {
+                        let (sender, root) = (sender.clone(), store.root.clone());
+                        thread::spawn(move || {
+                            deliver(
+                                &sender,
+                                owner,
+                                Completed::Updated(update::prepare(&release, &root)),
+                            )
+                        });
+                        continue;
+                    }
                     Job::Stop => break,
                 };
                 deliver(&sender, owner, completed);

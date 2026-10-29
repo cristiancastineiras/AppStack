@@ -236,7 +236,7 @@ if ($EditorOnly) {
             @{id=[guid]::NewGuid().ToString();name=[IO.Path]::GetFileNameWithoutExtension($_);target=@{kind='Application';value=(Join-Path (Join-Path $env:WINDIR 'System32') $_)}}
         }
         $configPath = Join-Path $root 'appstack.json'
-        $config = @{schema_version=2;settings=@{show_tray=$false;main_theme=$Theme;popup_theme=$Theme};groups=@(@{id=$groupId;name='Preview group';entries=@($entries)})}
+        $config = @{schema_version=2;settings=@{show_tray=$false;check_updates=$false;main_theme=$Theme;popup_theme=$Theme};groups=@(@{id=$groupId;name='Preview group';entries=@($entries)})}
         [IO.File]::WriteAllText($configPath,($config | ConvertTo-Json -Depth 12),(New-Object Text.UTF8Encoding($false)))
         $original = (Get-FileHash $configPath).Hash
         $process = $null
@@ -300,7 +300,7 @@ if ($EditorOnly) {
         @{ id=[guid]::NewGuid().ToString(); name='Tools'; target=@{kind='Group';value=$childId} }
     )
     $entries += @(0..999 | ForEach-Object { @{id=[guid]::NewGuid().ToString();name=('Application ' + $_);target=@{kind='Application';value=(Join-Path $env:WINDIR 'System32\notepad.exe')}} })
-    $configuration = @{schema_version=2;settings=@{show_tray=$false};groups=@(
+    $configuration = @{schema_version=2;settings=@{show_tray=$false;check_updates=$false};groups=@(
         @{id=$groupId;name='Work';appearance=@{columns=4;show_labels=$true};entries=$entries},
         @{id=$childId;name='Tools';entries=@(
             @{id=[guid]::NewGuid().ToString();name='Explorer';target=@{kind='Application';value=(Join-Path $env:WINDIR 'explorer.exe')}},

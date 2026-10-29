@@ -6,6 +6,7 @@ use super::{
     jobs::{self, Background, Completed, Job},
     shell::{self, failure, wide},
     ui::{self, Field, Font},
+    update,
 };
 use appstack::{
     command::{Action, Request},
@@ -56,6 +57,7 @@ const LAUNCH_ALL: u16 = 211;
 const BACK: u16 = 213;
 const ANIMATION: usize = 1;
 const WATCH: usize = 2;
+const UPDATES: usize = 3;
 const IMPORT: u16 = 301;
 const IMPORT_FOLDER: u16 = 302;
 const EXPORT: u16 = 303;
@@ -63,6 +65,7 @@ const DATA_FOLDER: u16 = 304;
 const QUIT: u16 = 399;
 const SETTINGS: u16 = 401;
 const ABOUT: u16 = 402;
+const CHECK_UPDATES: u16 = 403;
 const STATIC_END_ELLIPSIS: u32 = 0x4000;
 const SS_CENTERIMAGE: u32 = 0x200;
 
@@ -551,6 +554,10 @@ pub struct Application {
     tray_ids: Vec<(u32, Option<String>)>,
     pub taskbar_created: u32,
     pub quitting: bool,
+    /// Installs a downloaded update after the message loop ends.
+    pub relaunch: Option<std::process::Command>,
+    /// An accepted update is downloading, so later checks offer nothing.
+    updating: bool,
     /// Drag and drop for popups, set up with the first one; popups go before it.
     ole: Option<shell::OleApartment>,
 }
@@ -592,6 +599,8 @@ impl Application {
             tray_ids: Vec::new(),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             quitting: false,
+            relaunch: None,
+            updating: false,
             ole: None,
         })
     }
@@ -600,6 +609,13 @@ impl Application {
         self.update_tray();
         if !self.config.groups.is_empty() {
             self.job(Job::EnsureBrand(self.config.clone()));
+        }
+        if self.config.settings.check_updates {
+            self.job(Job::CheckUpdate(false));
+        }
+        // AppStack usually stays resident, so it also looks again every day.
+        unsafe {
+            SetTimer(Some(self.host), UPDATES, 24 * 60 * 60 * 1000, None);
         }
     }
 
@@ -950,7 +966,11 @@ impl Application {
                 ),
                 (
                     "&Settings",
-                    vec![(SETTINGS, "Preferences..."), (ABOUT, "About AppStack")],
+                    vec![
+                        (SETTINGS, "Preferences..."),
+                        (CHECK_UPDATES, "Check for updates..."),
+                        (ABOUT, "About AppStack"),
+                    ],
                 ),
             ] {
                 let menu = CreatePopupMenu().map_err(failure)?;
@@ -1515,6 +1535,7 @@ impl Application {
                 "Hand cursor on clickable popup items",
                 settings.pointer_cursor,
             ),
+            Field::check("Check for updates automatically", settings.check_updates),
         ];
         let mut fonts = ui::font_families();
         for current in [&settings.title_font, &settings.label_font] {
@@ -1548,16 +1569,17 @@ impl Application {
             settings.close_after_launch = values[7] == "true";
             settings.animations = values[8] == "true";
             settings.pointer_cursor = values[9] == "true";
+            settings.check_updates = values[10] == "true";
             let font = |value: &String| {
                 value
                     .parse::<usize>()
                     .ok()
                     .and_then(|index| fonts.get(index).cloned())
             };
-            if let Some(title) = font(&values[10]) {
+            if let Some(title) = font(&values[11]) {
                 settings.title_font = title;
             }
-            if let Some(label) = font(&values[11]) {
+            if let Some(label) = font(&values[12]) {
                 settings.label_font = label;
             }
             self.job(Job::Startup(settings.start_with_windows));
@@ -1756,11 +1778,18 @@ impl Application {
             }
             DATA_FOLDER => shell::open_path(&self.store.root),
             SETTINGS => self.preferences(),
+            CHECK_UPDATES => {
+                self.job(Job::CheckUpdate(true));
+                Ok(())
+            }
             ABOUT => {
                 shell::message(
                     Some(self.owner()),
                     "AppStack",
-                    "AppStack 1.0.0\nNative application groups for Windows\n\nMIT license.",
+                    &format!(
+                        "AppStack {}\nNative application groups for Windows\n\nMIT license.",
+                        update::CURRENT
+                    ),
                     false,
                 );
                 Ok(())
@@ -2148,6 +2177,12 @@ impl Application {
                     self.command(id)
                 }
             }
+            WM_TIMER if event.first == UPDATES && event.window == self.host => {
+                if self.config.settings.check_updates {
+                    self.job(Job::CheckUpdate(false));
+                }
+                Ok(())
+            }
             WM_TIMER if event.first == WATCH => {
                 let Some(index) = self
                     .popups
@@ -2349,6 +2384,7 @@ impl Application {
                             (1, "Open AppStack"),
                             (NEW_GROUP, "New group..."),
                             (SETTINGS, "Preferences..."),
+                            (CHECK_UPDATES, "Check for updates..."),
                             (0, ""),
                             (QUIT, "Exit"),
                         ],
@@ -2482,6 +2518,43 @@ impl Application {
                 }
                 Completed::Shortcut(result) => {
                     result?;
+                }
+                Completed::Release(manual, result) => match result {
+                    Ok(Some(release)) if !self.updating => {
+                        let question = format!(
+                            "AppStack {} is available. You have {}.\n\n{}\n\nDownload and install it now? AppStack restarts when it is done.",
+                            release.version,
+                            update::CURRENT,
+                            release.notes
+                        );
+                        if shell::confirm(self.owner(), &question) {
+                            if let Some(manager) = &self.manager {
+                                ui::set_text(
+                                    manager.status,
+                                    &format!("Downloading AppStack {}...", release.version),
+                                );
+                            }
+                            self.updating = true;
+                            self.job(Job::Update(release));
+                        }
+                    }
+                    Ok(None) if manual => shell::message(
+                        Some(self.owner()),
+                        "AppStack",
+                        &format!("AppStack {} is up to date.", update::CURRENT),
+                        false,
+                    ),
+                    Err(error) if manual => {
+                        return Err(format!("Could not check for updates: {error}"));
+                    }
+                    _ => {}
+                },
+                Completed::Updated(result) => {
+                    self.updating = false;
+                    self.relaunch = Some(
+                        result.map_err(|error| format!("Could not update AppStack: {error}"))?,
+                    );
+                    self.quitting = true;
                 }
                 Completed::Imported(result) => {
                     let groups = result?;

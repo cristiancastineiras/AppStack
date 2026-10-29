@@ -1,0 +1,56 @@
+name: Bug report
+description: Something in AppStack does not work as expected.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Security problems should be reported privately instead; see SECURITY.md.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Create a group with...
+        2. Open its popup from...
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: AppStack version
+      description: Settings > About AppStack.
+      placeholder: "1.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: edition
+    attributes:
+      label: How do you run AppStack?
+      options:
+        - Installer
+        - Portable executable
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: Run `winver` to see it.
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Screenshots, errors.log or other details
+      description: errors.log is in the data folder (File > Open data folder). Mention any assistive technology you use.

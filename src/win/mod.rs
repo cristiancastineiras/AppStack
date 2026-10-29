@@ -4,6 +4,7 @@ mod icons;
 mod jobs;
 pub mod shell;
 mod ui;
+mod update;
 
 use appstack::{command::Options, storage::Store};
 use std::{
@@ -110,23 +111,29 @@ pub fn run() -> Result<(), String> {
     options.request.y = top;
     if options.help {
         println!(
-            "AppStack 1.0.0\n\nappstack [--group ID|NAME] [--edit ID|NAME] [--launch-all ID|NAME]\n         [--silent] [--quit] [--portable] [--data-dir DIRECTORY]\n         [--check] [--list]"
+            "AppStack {}\n\nappstack [--group ID|NAME] [--edit ID|NAME] [--launch-all ID|NAME]\n         [--silent] [--quit] [--portable] [--data-dir DIRECTORY]\n         [--check] [--list]",
+            update::CURRENT
         );
         return Ok(());
     }
     let executable = std::env::current_exe().map_err(shell::failure)?;
-    let portable_marker = executable
-        .parent()
-        .is_some_and(|parent| parent.join("portable.txt").exists());
+    // The single-file release is named AppStackClassic-portable.exe.
+    let portable = options.portable
+        || executable
+            .parent()
+            .is_some_and(|parent| parent.join("portable.txt").exists())
+        || executable
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().to_lowercase().contains("portable"));
     let data_dir = options.data_dir.or_else(|| {
-        if options.portable || portable_marker {
+        if portable {
             None
         } else {
             std::env::var_os("LOCALAPPDATA")
                 .map(|root| std::path::PathBuf::from(root).join(crate::APP_NAME))
         }
     });
-    let store = Store::discover(options.portable, data_dir)?;
+    let store = Store::discover(portable, data_dir)?;
     startup_stage!("paths");
     if options.check || options.list {
         let config = store.load()?;
@@ -207,6 +214,7 @@ pub fn run() -> Result<(), String> {
         return Ok(());
     }
     startup_stage!("single_instance");
+    update::clean_up(&executable);
     unsafe {
         let _ = ResetEvent(instance.ready);
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -311,6 +319,13 @@ pub fn run() -> Result<(), String> {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+    // An update starts only after this instance has saved, closed and released its profile.
+    let relaunch = application.relaunch.take();
+    drop(application);
+    drop(instance);
+    if let Some(mut command) = relaunch {
+        command.spawn().map_err(shell::failure)?;
     }
     Ok(())
 }
