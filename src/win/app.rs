@@ -65,6 +65,7 @@ const BACK: u16 = 213;
 const ANIMATION: usize = 1;
 const WATCH: usize = 2;
 const UPDATES: usize = 3;
+const HOVER: usize = 4;
 const IMPORT: u16 = 301;
 const IMPORT_FOLDER: u16 = 302;
 const EXPORT: u16 = 303;
@@ -73,7 +74,10 @@ const QUIT: u16 = 399;
 const SETTINGS: u16 = 401;
 const ABOUT: u16 = 402;
 const CHECK_UPDATES: u16 = 403;
+const REGENERATE: u16 = 404;
 const STATIC_END_ELLIPSIS: u32 = 0x4000;
+/// The Open groups on hover choices, in the order Preferences lists them.
+const HOVER_OPEN: [HoverOpen; 3] = [HoverOpen::Off, HoverOpen::Delayed, HoverOpen::Instant];
 const SS_CENTERIMAGE: u32 = 0x200;
 
 struct Images {
@@ -161,21 +165,38 @@ impl Trace {
     }
 }
 
-fn show_popup(window: HWND, focus: HWND, animate: bool, trace: &mut Trace) -> Result<(), String> {
+/// Shows a popup; `activate` false leaves the foreground where it is, for popups the pointer
+/// opened without a click, which Windows would not let take the foreground anyway.
+fn show_popup(
+    window: HWND,
+    focus: HWND,
+    animation: Option<Animation>,
+    activate: bool,
+    trace: &mut Trace,
+) -> Result<(), String> {
     unsafe {
         let _ = RemovePropW(window, w!("AppStack.PopupReady"));
-        if animate {
-            ui::animate_in(window, focus);
+        if let Some(animation) = animation {
+            ui::animate_in(window, focus, animation);
         } else if GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0 != 0 {
             // A layered popup shows nothing until it has an opacity.
             let _ = SetLayeredWindowAttributes(window, COLORREF(0), 255, LWA_ALPHA);
         }
-        let _ = ShowWindow(window, SW_SHOWNORMAL);
+        let _ = ShowWindow(
+            window,
+            if activate {
+                SW_SHOWNORMAL
+            } else {
+                SW_SHOWNOACTIVATE
+            },
+        );
         trace.mark("shown");
         let _ = RedrawWindow(Some(window), None, None, RDW_ALLCHILDREN | RDW_UPDATENOW);
         trace.mark("painted");
-        let _ = SetForegroundWindow(window);
-        let _ = SetFocus(Some(focus));
+        if activate {
+            let _ = SetForegroundWindow(window);
+            let _ = SetFocus(Some(focus));
+        }
         trace.mark("focused");
         SetPropW(
             window,
@@ -485,8 +506,17 @@ fn group_fields(group: &Group, styles: Vec<(String, Vec<(String, String)>)>) -> 
         ),
         Field::choice(
             "Group icon",
-            &["Single", "Grid", "Mosaic"],
-            usize::from(appearance.grid_icon) * (1 + usize::from(appearance.mosaic_icon)),
+            &["Single", "Grid", "Mosaic", "Stack"],
+            match (
+                appearance.grid_icon,
+                appearance.mosaic_icon,
+                appearance.stack_icon,
+            ) {
+                (false, ..) => 0,
+                (true, _, true) => 3,
+                (true, true, false) => 2,
+                (true, false, false) => 1,
+            },
         ),
         Field::text("Icon path (.ico, .png, .exe)", &appearance.icon),
         Field::check(
@@ -609,6 +639,7 @@ fn apply_group_values(group: &mut Group, values: &[String]) -> Result<(), String
     };
     appearance.grid_icon = values[2] != "0";
     appearance.mosaic_icon = values[2] == "2";
+    appearance.stack_icon = values[2] == "3";
     appearance.icon = values[3].trim().into();
     appearance.show_on_tray = values[4] == "true";
     let number = |index: usize| {
@@ -730,6 +761,8 @@ struct Popup {
     flipped: Option<std::time::Instant>,
     /// Takes applications dropped on the popup, as a folder does.
     drop_target: Option<IDropTarget>,
+    /// Opened by the pointer resting on its icon and not clicked into since.
+    hovered: bool,
     /// While inactive and still open: whether a mouse button went down outside it since.
     outside: Option<bool>,
 }
@@ -769,6 +802,15 @@ impl Drop for Popup {
     }
 }
 
+/// The taskbar or tray item under the pointer, for Open groups on hover: the group it opens, if
+/// any, its screen bounds, when the pointer arrived, and whether it already opened the group.
+struct Hover {
+    group: Option<String>,
+    bounds: RECT,
+    since: std::time::Instant,
+    opened: bool,
+}
+
 pub struct Application {
     pub host: HWND,
     pub store: Store,
@@ -796,6 +838,8 @@ pub struct Application {
     updating: bool,
     /// Drag and drop for popups, set up with the first one; popups go before it.
     ole: Option<shell::OleApartment>,
+    hover: Option<Hover>,
+    automation: Option<IUIAutomation>,
 }
 
 impl Application {
@@ -838,11 +882,14 @@ impl Application {
             relaunch: None,
             updating: false,
             ole: None,
+            hover: None,
+            automation: None,
         })
     }
 
     pub fn initialize_shell(&mut self) {
         self.update_tray();
+        self.update_hover();
         if !self.config.groups.is_empty() {
             self.job(Job::EnsureBrand(self.config.clone()));
         }
@@ -869,7 +916,7 @@ impl Application {
             // Unpinned groups are prepared too: reuse moves the popup to wherever it opens on
             // this monitor, and the taskbar lookup only warms the anchor of pinned ones.
             let anchor = self.taskbar_point(&id, point).unwrap_or(point);
-            self.build_popup(&id, anchor, None, false, false)?;
+            self.build_popup(&id, anchor, None, false, false, false)?;
         }
         Ok(())
     }
@@ -1169,6 +1216,7 @@ impl Application {
                         ),
                         (EXPORT, "Export backup..."),
                         (DATA_FOLDER, "Open data folder"),
+                        (REGENERATE, "Regenerate shortcuts and icons"),
                         (QUIT, "Exit AppStack"),
                     ],
                 ),
@@ -1434,6 +1482,7 @@ impl Application {
         self.job(Job::Synchronize(self.config.clone()));
         self.refresh_manager();
         self.update_tray();
+        self.update_hover();
         Ok(())
     }
 
@@ -1790,6 +1839,14 @@ impl Application {
                 "Grayscale group shortcut icons",
                 settings.grayscale_shortcuts,
             ),
+            Field::choice(
+                "Open groups on hover",
+                &["Off", "After a short rest", "Immediately"],
+                HOVER_OPEN
+                    .iter()
+                    .position(|mode| *mode == settings.hover_open)
+                    .unwrap_or(0),
+            ),
             Field::page("Appearance"),
             Field::choice(
                 "Manager theme",
@@ -1803,7 +1860,21 @@ impl Application {
             ),
             // Right above the two selects it fills.
             Field::style("Font theme", font_themes(&fonts)),
-            Field::check("Popup animations", settings.animations),
+            Field::Choice {
+                label: "Popup animation".into(),
+                values: std::iter::once("None")
+                    .chain(ANIMATIONS.iter().map(|(_, name)| *name))
+                    .map(String::from)
+                    .collect(),
+                selected: if settings.animations {
+                    ANIMATIONS
+                        .iter()
+                        .position(|(animation, _)| *animation == settings.animation)
+                        .map_or(1, |index| index + 1)
+                } else {
+                    0
+                },
+            },
             font_field(TITLE_FONT_FIELD, &settings.title_font),
             font_field(LABEL_FONT_FIELD, &settings.label_font),
             Field::check(
@@ -1826,23 +1897,31 @@ impl Application {
             settings.launch_all_enabled = values[4] == "true";
             settings.close_after_launch = values[5] == "true";
             settings.grayscale_shortcuts = values[6] == "true";
-            settings.main_theme = themes[values[7].parse::<usize>().unwrap_or(0).min(2)];
-            settings.popup_theme = themes[values[8].parse::<usize>().unwrap_or(0).min(2)];
+            settings.hover_open = HOVER_OPEN[values[7].parse::<usize>().unwrap_or(0).min(2)];
+            settings.main_theme = themes[values[8].parse::<usize>().unwrap_or(0).min(2)];
+            settings.popup_theme = themes[values[9].parse::<usize>().unwrap_or(0).min(2)];
             // The font theme only fills the selects below it, so it has no value of its own.
-            settings.animations = values[9] == "true";
+            let animation = values[10].parse::<usize>().unwrap_or(1);
+            settings.animations = animation != 0;
+            if let Some((chosen, _)) = animation
+                .checked_sub(1)
+                .and_then(|index| ANIMATIONS.get(index))
+            {
+                settings.animation = *chosen;
+            }
             let font = |value: &String| {
                 value
                     .parse::<usize>()
                     .ok()
                     .and_then(|index| fonts.get(index).cloned())
             };
-            if let Some(title) = font(&values[10]) {
+            if let Some(title) = font(&values[11]) {
                 settings.title_font = title;
             }
-            if let Some(label) = font(&values[11]) {
+            if let Some(label) = font(&values[12]) {
                 settings.label_font = label;
             }
-            settings.pointer_cursor = values[12] == "true";
+            settings.pointer_cursor = values[13] == "true";
             self.job(Job::Startup(settings.start_with_windows));
             self.commit(candidate)?;
             ui::set_menu_theme(self.config.settings.main_theme);
@@ -1954,6 +2033,7 @@ impl Application {
                         candidate.groups[group].appearance.icon =
                             path.to_string_lossy().into_owned();
                         candidate.groups[group].appearance.grid_icon = false;
+                        candidate.groups[group].appearance.stack_icon = false;
                     } else {
                         let entry = self.entry_index().ok_or("No application selected")?;
                         candidate.groups[group].entries[entry].icon =
@@ -1979,7 +2059,8 @@ impl Application {
             }
             SHORTCUT_FOLDER => {
                 let group = self.selected_group().ok_or("No group selected")?.clone();
-                let path = shell::shortcut(&self.store, &group, None)?;
+                let icon = jobs::group_icon(&self.store, &group.id);
+                let path = shell::shortcut(&self.store, &group, icon.as_deref())?;
                 shell::open_path(path.parent().ok_or("Shortcut has no folder")?)
             }
             LAUNCH_ALL => self.launch_group(&self.selected_group().ok_or("No group selected")?.id),
@@ -2043,6 +2124,13 @@ impl Application {
                 Ok(())
             }
             DATA_FOLDER => shell::open_path(&self.store.root),
+            REGENERATE => {
+                // A failed extraction is cached like a good icon, so start over from the sources.
+                let _ = std::fs::remove_dir_all(self.store.root.join("icon-cache"));
+                self.apply(self.config.clone(), true)?;
+                self.job(Job::RefreshIcons);
+                Ok(())
+            }
             SETTINGS => self.preferences(),
             CHECK_UPDATES => {
                 self.job(Job::CheckUpdate(true));
@@ -2104,6 +2192,103 @@ impl Application {
         }
         for spec in requested {
             self.request_icon(spec);
+        }
+    }
+
+    /// Watches the pointer only while Open groups on hover is on.
+    fn update_hover(&mut self) {
+        self.hover = None;
+        unsafe {
+            if self.config.settings.hover_open == HoverOpen::Off {
+                let _ = KillTimer(Some(self.host), HOVER);
+            } else {
+                SetTimer(Some(self.host), HOVER, 100, None);
+            }
+        }
+    }
+
+    /// Opens a group once the pointer has rested on its taskbar or tray icon long enough.
+    fn hover_tick(&mut self) -> Result<(), String> {
+        let Some(delay) = self.config.settings.hover_open.delay_ms() else {
+            return Ok(());
+        };
+        let mut point = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut point);
+        }
+        if !self
+            .hover
+            .as_ref()
+            .is_some_and(|hover| contains(&hover.bounds, point))
+        {
+            self.hover = self.taskbar_item_at(point).map(|(group, bounds)| Hover {
+                group,
+                bounds,
+                since: std::time::Instant::now(),
+                opened: false,
+            });
+        }
+        let Some(hover) = &mut self.hover else {
+            return Ok(());
+        };
+        // A press is a click or a drag, which the taskbar handles itself.
+        if hover.opened || hover.since.elapsed().as_millis() < delay || mouse_down() {
+            return Ok(());
+        }
+        hover.opened = true;
+        let Some(group) = hover.group.clone() else {
+            return Ok(());
+        };
+        let anchor = POINT {
+            x: (hover.bounds.left + hover.bounds.right) / 2,
+            y: (hover.bounds.top + hover.bounds.bottom) / 2,
+        };
+        if self.config.group(&group).is_none()
+            || self
+                .popups
+                .first()
+                .is_some_and(|popup| popup.group_id == group)
+        {
+            return Ok(());
+        }
+        self.build_popup(&group, anchor, None, true, true, false)
+    }
+
+    /// The taskbar item under a screen point and the group it opens, if it is a group's
+    /// pinned button. Anything else on the taskbar is remembered too, so the pointer resting
+    /// on it does not ask the taskbar again on every tick.
+    fn taskbar_item_at(&mut self, point: POINT) -> Option<(Option<String>, RECT)> {
+        unsafe {
+            let root = GetAncestor(WindowFromPoint(point), GA_ROOT);
+            let mut class = [0u16; 32];
+            let length = GetClassNameW(root, &mut class).max(0) as usize;
+            let class = String::from_utf16_lossy(&class[..length]);
+            if class != "Shell_TrayWnd" && class != "Shell_SecondaryTrayWnd" {
+                return None;
+            }
+            if self.automation.is_none() {
+                self.automation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok();
+            }
+            let automation = self.automation.as_ref()?;
+            let walker = automation.ControlViewWalker().ok()?;
+            let prefix = format!("Appid: {}.Group.", crate::APP_NAME);
+            let leaf = automation.ElementFromPoint(point).ok()?;
+            let mut element = leaf.clone();
+            // The point can land on a part of the button, such as its image.
+            for _ in 0..3 {
+                let id = element.CurrentAutomationId().map(|id| id.to_string());
+                if let Some(group) = id
+                    .ok()
+                    .and_then(|id| id.strip_prefix(&prefix).map(String::from))
+                {
+                    return Some((Some(group), element.CurrentBoundingRectangle().ok()?));
+                }
+                let Ok(parent) = walker.GetParentElement(&element) else {
+                    break;
+                };
+                element = parent;
+            }
+            Some((None, leaf.CurrentBoundingRectangle().ok()?))
         }
     }
 
@@ -2283,12 +2468,8 @@ impl Application {
                         .and_then(|id| self.config.group(id))
                         .cloned();
                     if let Some(group) = group {
-                        let icon = jobs::group_icon_path(&self.store, &group);
-                        let shortcut = shell::shortcut(
-                            &self.store,
-                            &group,
-                            icon.is_file().then_some(icon.as_path()),
-                        )?;
+                        let icon = jobs::group_icon(&self.store, &group.id);
+                        let shortcut = shell::shortcut(&self.store, &group, icon.as_deref())?;
                         shell::drag_shortcut(self.owner(), &shortcut)?;
                     }
                     return Ok(());
@@ -2450,6 +2631,7 @@ impl Application {
                 }
                 Ok(())
             }
+            WM_TIMER if event.first == HOVER && event.window == self.host => self.hover_tick(),
             WM_TIMER if event.first == WATCH => {
                 let Some(index) = self
                     .popups
@@ -2468,6 +2650,7 @@ impl Application {
                 // Activation back in a popup hands closing over to WM_ACTIVATE again.
                 if active || popup.outside.is_none() {
                     popup.outside = None;
+                    popup.hovered &= !active;
                     unsafe {
                         let _ = KillTimer(Some(popup.window), WATCH);
                     }
@@ -2650,6 +2833,28 @@ impl Application {
                     } else {
                         self.show_manager()
                     }
+                } else if event.second as u32 == WM_MOUSEMOVE {
+                    // Tray icons report the pointer themselves; hover_tick does the waiting.
+                    let id = event.first as u32;
+                    let group = self
+                        .tray_ids
+                        .iter()
+                        .find(|(tray, _)| *tray == id)
+                        .and_then(|(_, group)| group.clone());
+                    if group.is_some()
+                        && self.config.settings.hover_open != HoverOpen::Off
+                        && !self.hover.as_ref().is_some_and(|hover| {
+                            hover.group == group && contains(&hover.bounds, point)
+                        })
+                    {
+                        self.hover = shell::tray_bounds(self.host, id).map(|bounds| Hover {
+                            group,
+                            bounds,
+                            since: std::time::Instant::now(),
+                            opened: false,
+                        });
+                    }
+                    Ok(())
                 } else if event.second as u32 == WM_RBUTTONUP {
                     let group = self
                         .tray_ids
@@ -2696,6 +2901,7 @@ impl Application {
                             (NEW_GROUP, "New group..."),
                             (SETTINGS, "Preferences..."),
                             (CHECK_UPDATES, "Check for updates..."),
+                            (REGENERATE, "Regenerate shortcuts and icons"),
                             (0, ""),
                             (QUIT, "Exit"),
                         ]);
@@ -2986,9 +3192,11 @@ impl Application {
         point: POINT,
         parent: Option<usize>,
     ) -> Result<(), String> {
-        self.build_popup(id, point, parent, true, true)
+        self.build_popup(id, point, parent, true, true, true)
     }
 
+    /// `activate` shows the popup rather than preparing it hidden; `foreground` also gives it
+    /// the keyboard, which only an opening the user clicked or typed for can do.
     fn build_popup(
         &mut self,
         id: &str,
@@ -2996,17 +3204,23 @@ impl Application {
         parent: Option<usize>,
         activate: bool,
         animate: bool,
+        foreground: bool,
     ) -> Result<(), String> {
-        let animate = animate && self.config.settings.animations;
+        let settings = &self.config.settings;
+        let animation = (animate && settings.animations).then_some(settings.animation);
         let mut trace = Trace::new();
         if let Some(parent) = parent {
             return self.navigate(parent, Some(id));
         }
-        if self
-            .popups
-            .first()
-            .is_some_and(|popup| popup.group_id == id)
-        {
+        if let Some(popup) = self.popups.first_mut().filter(|popup| popup.group_id == id) {
+            // A click on the icon that a popup opened under keeps it and gives it the keyboard.
+            if foreground && std::mem::take(&mut popup.hovered) {
+                unsafe {
+                    let _ = SetForegroundWindow(popup.window);
+                    let _ = SetFocus(Some(popup.list));
+                }
+                return Ok(());
+            }
             self.hide_popups(0);
             return Ok(());
         }
@@ -3052,6 +3266,8 @@ impl Application {
                 let focus = popup.list;
                 // Like the Start menu, a reopened popup starts at the first page of its root.
                 let moved = !popup.path.is_empty() || popup.scroll != 0 || popup.target != 0;
+                let mut popup = popup;
+                popup.hovered = !foreground;
                 self.popups.push(popup);
                 let index = self.popups.len() - 1;
                 if moved {
@@ -3059,7 +3275,10 @@ impl Application {
                     self.show_folder(index)?;
                 }
                 trace.mark("placed");
-                show_popup(window, focus, animate, &mut trace)?;
+                show_popup(window, focus, animation, foreground, &mut trace)?;
+                if !foreground {
+                    self.watch(index, false);
+                }
                 trace.write("reused");
                 return Ok(());
             }
@@ -3483,12 +3702,16 @@ impl Application {
                 target: 0,
                 flipped: None,
                 drop_target: None,
+                hovered: !foreground,
                 outside: None,
             });
             self.render_popup(index)?;
             trace.mark("item_controls");
             if activate {
-                show_popup(window, list, animate, &mut trace)?;
+                show_popup(window, list, animation, foreground, &mut trace)?;
+                if !foreground {
+                    self.watch(index, false);
+                }
             } else {
                 self.hide_popups(index);
                 ui::prepare_edge(window);
@@ -4182,6 +4405,7 @@ impl Application {
             None,
             true,
             false,
+            true,
         )?;
         let Some(index) = self.popups.iter().position(|popup| popup.group_id == root) else {
             return Ok(());
@@ -4247,6 +4471,10 @@ impl Application {
     }
 }
 
+fn contains(bounds: &RECT, point: POINT) -> bool {
+    (bounds.left..bounds.right).contains(&point.x) && (bounds.top..bounds.bottom).contains(&point.y)
+}
+
 /// Windows paths ignore case and take either slash.
 fn same_path(first: &str, second: &str) -> bool {
     let normal = |path: &str| path.replace('/', "\\").to_lowercase();
@@ -4297,7 +4525,7 @@ fn command_icon(id: u16) -> Option<usize> {
         LAUNCH_ADMIN => icon::SHIELD,
         LAUNCH_ALL => icon::SQUARE_ARROW_OUT_UP_RIGHT,
         SETTINGS => icon::SETTINGS,
-        CHECK_UPDATES => icon::REFRESH_CW,
+        CHECK_UPDATES | REGENERATE => icon::REFRESH_CW,
         QUIT => icon::LOG_OUT,
         _ => return None,
     })
@@ -4491,7 +4719,7 @@ mod tests {
         // Distinct values each select can show exactly, so a shifted index changes something.
         let look = &mut group.appearance;
         look.sort = SortMode::Alphabetical;
-        (look.grid_icon, look.mosaic_icon) = (true, true);
+        (look.grid_icon, look.mosaic_icon, look.stack_icon) = (true, false, true);
         look.icon = "C:\\icon.ico".into();
         look.show_on_tray = true;
         look.card_layout = true;

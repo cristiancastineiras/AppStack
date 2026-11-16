@@ -20,6 +20,45 @@ pub enum SortMode {
     Alphabetical,
 }
 
+/// How a popup opens when `Settings::animations` is on; Pop is the original.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Animation {
+    #[default]
+    Pop,
+    Fade,
+    Slide,
+    Zoom,
+    Cascade,
+}
+
+pub const ANIMATIONS: [(Animation, &str); 5] = [
+    (Animation::Pop, "Pop (original)"),
+    (Animation::Fade, "Fade"),
+    (Animation::Slide, "Slide up"),
+    (Animation::Zoom, "Zoom"),
+    (Animation::Cascade, "Cascade"),
+];
+
+/// Opening a group's popup by resting the pointer on its taskbar or tray icon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HoverOpen {
+    #[default]
+    Off,
+    Delayed,
+    Instant,
+}
+
+impl HoverOpen {
+    /// How long the pointer rests before the popup opens.
+    pub fn delay_ms(self) -> Option<u128> {
+        match self {
+            Self::Off => None,
+            Self::Delayed => Some(600),
+            Self::Instant => Some(0),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LabelPosition {
     #[default]
@@ -121,6 +160,8 @@ pub struct Settings {
     pub grayscale_shortcuts: bool,
     pub close_after_launch: bool,
     pub animations: bool,
+    pub animation: Animation,
+    pub hover_open: HoverOpen,
     pub pointer_cursor: bool,
     pub check_updates: bool,
     pub title_font: String,
@@ -139,6 +180,8 @@ impl Default for Settings {
             grayscale_shortcuts: false,
             close_after_launch: true,
             animations: true,
+            animation: Animation::Pop,
+            hover_open: HoverOpen::Off,
             pointer_cursor: true,
             check_updates: true,
             title_font: TITLE_FONT.into(),
@@ -155,6 +198,8 @@ pub struct Appearance {
     /// With `grid_icon`, alternates large and small tiles; a separate flag so older versions
     /// still read the configuration and show a plain grid.
     pub mosaic_icon: bool,
+    /// With `grid_icon`, overlaps the icons like a stack of cards; separate for the same reason.
+    pub stack_icon: bool,
     pub columns: usize,
     pub show_labels: bool,
     pub label_position: LabelPosition,
@@ -191,6 +236,7 @@ impl Default for Appearance {
             icon: String::new(),
             grid_icon: true,
             mosaic_icon: false,
+            stack_icon: false,
             columns: 4,
             show_labels: true,
             label_position: LabelPosition::Bottom,

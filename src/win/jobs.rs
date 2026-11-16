@@ -19,6 +19,8 @@ pub enum Job {
     Shortcut(Group, bool),
     Synchronize(Config),
     EnsureBrand(Config),
+    /// Makes Explorer drop its cached icons; queued after a Synchronize that rewrote them.
+    RefreshIcons,
     Startup(bool),
     /// Whether the user asked, so an automatic check stays quiet unless it finds something.
     CheckUpdate(bool),
@@ -52,11 +54,36 @@ pub struct Background {
     worker: Option<thread::JoinHandle<()>>,
 }
 
-pub fn group_icon_path(store: &Store, group: &Group) -> PathBuf {
-    store
-        .root
-        .join("group-icons")
-        .join(format!("{}-{}.ico", group.id, crate::LOGO_REVISION))
+/// The group's current icon file for shortcuts, as `Synchronize` last wrote it.
+pub fn group_icon(store: &Store, id: &str) -> Option<PathBuf> {
+    group_icons(store, id).next()
+}
+
+fn group_icons(store: &Store, id: &str) -> impl Iterator<Item = PathBuf> {
+    let prefix = format!("{id}-");
+    std::fs::read_dir(store.root.join("group-icons"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|file| file.path())
+        .filter(move |path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+}
+
+/// Writes a group's shortcut icon under a name taken from its contents: Windows caches icons
+/// by path, so a changed icon needs a new path to show. Older files of the group are left for
+/// the caller to remove once no shortcut points at them.
+fn write_group_icon(store: &Store, config: &Config, group: &Group) -> Option<PathBuf> {
+    let spec = group_spec(config, group, 64, config.settings.grayscale_shortcuts);
+    let (_, cached) = icons::load(&spec, &store.root.join("icon-cache")).ok()?;
+    let path = store.root.join("group-icons").join(format!(
+        "{}-{}",
+        group.id,
+        cached.file_name()?.to_string_lossy()
+    ));
+    std::fs::copy(&cached, &path).ok().map(|_| path)
 }
 
 fn deliver(sender: &mpsc::Sender<Completed>, owner: usize, result: Completed) {
@@ -94,6 +121,7 @@ pub fn group_spec(config: &Config, group: &Group, size: u32, grayscale: bool) ->
         paths,
         composite: group.appearance.grid_icon,
         mosaic: group.appearance.grid_icon && group.appearance.mosaic_icon,
+        stack: group.appearance.grid_icon && group.appearance.stack_icon,
         grayscale,
         size,
     }
@@ -105,6 +133,7 @@ pub fn entry_spec(config: &Config, entry: &Entry, size: u32) -> Spec {
             paths: vec![entry.icon.clone()],
             composite: false,
             mosaic: false,
+            stack: false,
             grayscale: false,
             size,
         }
@@ -114,6 +143,7 @@ pub fn entry_spec(config: &Config, entry: &Entry, size: u32) -> Spec {
                 paths: vec![path.clone()],
                 composite: false,
                 mosaic: false,
+                stack: false,
                 grayscale: false,
                 size,
             },
@@ -124,6 +154,7 @@ pub fn entry_spec(config: &Config, entry: &Entry, size: u32) -> Spec {
                     paths: Vec::new(),
                     composite: false,
                     mosaic: false,
+                    stack: false,
                     grayscale: false,
                     size,
                 }),
@@ -196,47 +227,49 @@ impl Background {
                         }
                     }
                     Job::Shortcut(group, desktop) => {
-                        let icon = group_icon_path(&store, &group);
-                        let result = shell::shortcut(
-                            &store,
-                            &group,
-                            icon.is_file().then_some(icon.as_path()),
-                        )
-                        .and_then(|path| {
-                            if desktop {
-                                let desktop = shell::desktop()?;
-                                let filename = path.file_name().ok_or("Shortcut has no name")?;
-                                let output = desktop.join(filename);
-                                if output.exists() {
-                                    return Err(
+                        let icon = group_icon(&store, &group.id);
+                        let result =
+                            shell::shortcut(&store, &group, icon.as_deref()).and_then(|path| {
+                                if desktop {
+                                    let desktop = shell::desktop()?;
+                                    let filename =
+                                        path.file_name().ok_or("Shortcut has no name")?;
+                                    let output = desktop.join(filename);
+                                    // Asking again refreshes the group's own shortcut.
+                                    if output.exists()
+                                        && shell::link_group(&store, &output).as_deref()
+                                            != Some(group.id.as_str())
+                                    {
+                                        return Err(
                                         "A shortcut with this name already exists on the desktop"
                                             .into(),
                                     );
+                                    }
+                                    std::fs::copy(&path, &output).map_err(shell::failure)?;
                                 }
-                                std::fs::copy(&path, &output).map_err(shell::failure)?;
-                            }
-                            Ok(path)
-                        });
+                                Ok(path)
+                            });
                         Completed::Shortcut(result)
                     }
                     Job::Synchronize(config) | Job::EnsureBrand(config) => {
-                        let directory = store.root.join("group-icons");
-                        let _ = std::fs::create_dir_all(&directory);
+                        let _ = std::fs::create_dir_all(store.root.join("group-icons"));
+                        let copies = shell::group_copies(&store);
                         let mut errors = Vec::new();
                         for group in &config.groups {
-                            let spec =
-                                group_spec(&config, group, 64, config.settings.grayscale_shortcuts);
-                            let path = group_icon_path(&store, group);
-                            let icon = icons::load(&spec, &store.root.join("icon-cache"));
-                            if let Ok((_, cached)) = icon {
-                                let _ = std::fs::copy(cached, &path);
+                            let icon = write_group_icon(&store, &config, group)
+                                .or_else(|| group_icon(&store, &group.id));
+                            match shell::shortcut(&store, group, icon.as_deref()) {
+                                Ok(path) => shell::refresh_copies(
+                                    &path,
+                                    copies.get(&group.id).map_or(&[], Vec::as_slice),
+                                ),
+                                Err(error) => errors.push(error),
                             }
-                            if let Err(error) = shell::shortcut(
-                                &store,
-                                group,
-                                path.is_file().then_some(path.as_path()),
-                            ) {
-                                errors.push(error);
+                            // Only now that every copy points at the current icon.
+                            for old in group_icons(&store, &group.id) {
+                                if Some(&old) != icon.as_ref() {
+                                    let _ = std::fs::remove_file(old);
+                                }
                             }
                             if let Err(error) = shell::update_jump_list(
                                 &store,
@@ -259,6 +292,10 @@ impl Background {
                                 .map(|error| format!("Shell integration: {error}"))
                                 .unwrap_or_default(),
                         )
+                    }
+                    Job::RefreshIcons => {
+                        shell::refresh_icon_cache();
+                        Completed::Status("Shortcuts and icons regenerated".into())
                     }
                     Job::Startup(enabled) => match shell::startup(&store, enabled) {
                         Ok(()) => Completed::Status(String::new()),
