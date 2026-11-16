@@ -27,6 +27,7 @@ pub struct Spec {
     pub paths: Vec<String>,
     pub composite: bool,
     pub mosaic: bool,
+    pub stack: bool,
     pub grayscale: bool,
     pub size: u32,
 }
@@ -97,10 +98,24 @@ pub fn load(spec: &Spec, root: &Path) -> Result<(Icon, PathBuf), String> {
         .paths
         .iter()
         .filter(|path| !path.is_empty())
-        .take(if spec.composite { 4 } else { 1 })
+        .take(match (spec.composite, spec.stack) {
+            (false, _) => 1,
+            (true, false) => 4,
+            // More than three cards would leave too little of each one showing.
+            (true, true) => 3,
+        })
         .collect();
     if paths.is_empty() {
         canvas = render_icon(brand()?.handle(), size)?;
+    } else if spec.stack {
+        let tile = stack_tile(paths.len() as u32, size);
+        // Back to front, so the first application sits on top.
+        for (index, source) in paths.iter().enumerate().rev() {
+            let decoded =
+                decode_icon(source, tile).or_else(|_| render_icon(brand()?.handle(), tile))?;
+            let (left, top) = stack_position(index as u32, paths.len() as u32, tile, size);
+            imageops::overlay(&mut canvas, &decoded, left as i64, top as i64);
+        }
     } else {
         for (index, source) in paths.iter().enumerate() {
             let cell = if spec.composite && paths.len() > 1 {
@@ -152,6 +167,21 @@ fn mosaic_position(index: u32, cell: u32, tile: u32, size: u32) -> (u32, u32) {
         (index % 2) * (cell + 4) + center,
         (index / 2) * (cell + 4) + center,
     )
+}
+
+/// Side of each card in a stack: one icon fills the canvas, more shrink so all fit.
+fn stack_tile(count: u32, size: u32) -> u32 {
+    if count <= 1 { size } else { size * 7 / 10 }
+}
+
+/// Top-left corner of card `index` (0 in front) in a stack of `count`: the front card sits at
+/// the bottom left and each one behind it steps up and to the right.
+fn stack_position(index: u32, count: u32, tile: u32, size: u32) -> (u32, u32) {
+    if count <= 1 {
+        return (0, 0);
+    }
+    let step = (size - tile) / (count - 1);
+    (index * step, size - tile - index * step)
 }
 
 fn load_file(path: &Path, size: u32) -> Result<Icon, String> {
@@ -361,5 +391,23 @@ mod tests {
         assert_eq!(mosaic_position(1, cell, small, size), (34 + 5, 5));
         assert_eq!(mosaic_position(2, cell, small, size), (5, 34 + 5));
         assert_eq!(mosaic_position(0, size, size, size), (0, 0));
+    }
+
+    #[test]
+    fn stack_cards_step_diagonally_and_stay_inside_the_canvas() {
+        let size = 64;
+        assert_eq!(stack_position(0, 1, stack_tile(1, size), size), (0, 0));
+        for count in 2..=3 {
+            let tile = stack_tile(count, size);
+            assert!(tile < size);
+            // Front card at the bottom left, last card at the top right corner.
+            assert_eq!(stack_position(0, count, tile, size), (0, size - tile));
+            let (left, top) = stack_position(count - 1, count, tile, size);
+            assert!(left + tile <= size && top < size - tile);
+            assert!(
+                size - tile - left <= count,
+                "the back card reaches the right edge"
+            );
+        }
     }
 }

@@ -2,7 +2,8 @@
 
 use super::shell::{failure, wide};
 use appstack::model::{
-    Appearance, ButtonPosition, Group, LabelPosition, ROUNDED_FULL, Settings, TITLE_FONT, Theme,
+    Animation, Appearance, ButtonPosition, Group, LabelPosition, ROUNDED_FULL, Settings,
+    TITLE_FONT, Theme,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -57,7 +58,7 @@ thread_local! {
     // Edge windows and the popup frame each one draws.
     static EDGES: RefCell<HashMap<usize, Edge>> = RefCell::new(HashMap::new());
     // Opening popups: start, resting position and icon list.
-    static POPS: RefCell<HashMap<usize, (std::time::Instant, POINT, HWND)>> = RefCell::new(HashMap::new());
+    static POPS: RefCell<HashMap<usize, (std::time::Instant, POINT, HWND, Animation)>> = RefCell::new(HashMap::new());
     // Hand cursor over clickable popup items, like CSS `cursor: pointer`.
     static POINTER: Cell<bool> = const { Cell::new(false) };
     // Ghost buttons: hovered flag and the icon-font glyph each one draws.
@@ -90,6 +91,13 @@ pub fn push(window: HWND, code: u32, first: usize, second: isize) {
             text: String::new(),
         })
     });
+    // A message sent from another thread, like Explorer's tray callbacks, runs inside
+    // GetMessageW, which then keeps waiting; a posted one makes it return to handle the event.
+    unsafe {
+        if InSendMessageEx(None) != ISMEX_NOSEND {
+            let _ = PostMessageW(Some(window), WM_NULL, WPARAM(0), LPARAM(0));
+        }
+    }
 }
 
 pub fn pop() -> Option<Event> {
@@ -363,8 +371,8 @@ pub struct Look {
     pub card: bool,
     pub accent: Option<u32>,
     pub hot: i32,
-    /// When the icons started popping in; None once they all have.
-    pub spawn: Option<std::time::Instant>,
+    /// When the icons started popping in, and how; None once they all have.
+    pub spawn: Option<(std::time::Instant, Animation)>,
 }
 
 impl Look {
@@ -938,7 +946,22 @@ unsafe fn custom_draw(draw: &NMLVCUSTOMDRAW) -> Option<LRESULT> {
     }
     let dc = draw.nmcd.hdc;
     let index = draw.nmcd.dwItemSpec;
+    // While the popup opens, each icon fades and moves in after the previous one.
+    let (progress, grow, shift) = look.spawn.map_or((1.0, 1.0, 0.0), |(start, animation)| {
+        let progress = spawn_progress(start, index, animation);
+        let (grow, shift) = icon_motion(animation, progress);
+        (progress, grow, shift)
+    });
+    if progress <= 0.0 {
+        return Some(LRESULT(CDRF_SKIPDEFAULT as isize));
+    }
+    let shift = scale(shift.round() as i32, look.dpi);
     let cell = cell(list, &look, index);
+    let cell = RECT {
+        top: cell.top + shift,
+        bottom: cell.bottom + shift,
+        ..cell
+    };
     let (offset_x, offset_y) = look.icon_offset();
     let position = POINT {
         x: cell.left + offset_x,
@@ -956,11 +979,6 @@ unsafe fn custom_draw(draw: &NMLVCUSTOMDRAW) -> Option<LRESULT> {
     .0 as u32;
     let selected = state & LVIS_SELECTED.0 != 0;
     let hot = look.hot == index as i32;
-    // While the popup opens, each icon fades and scales in after the previous one.
-    let progress = look.spawn.map_or(1.0, |start| spawn_progress(start, index));
-    if progress <= 0.0 {
-        return Some(LRESULT(CDRF_SKIPDEFAULT as isize));
-    }
     let appear = |color: u32| blend(background, color, (progress * 100.0) as u32);
     let fill = if selected {
         Some(blend(background, accent, if hot { 26 } else { 18 }))
@@ -1021,7 +1039,7 @@ unsafe fn custom_draw(draw: &NMLVCUSTOMDRAW) -> Option<LRESULT> {
         .0,
     );
     if progress < 1.0 {
-        let size = (look.icon as f32 * pop_scale(progress)).round() as i32;
+        let size = (look.icon as f32 * grow).round() as i32;
         let _ = ImageList_DrawIndirect(&IMAGELISTDRAWPARAMS {
             cbSize: size_of::<IMAGELISTDRAWPARAMS>() as u32,
             himl: images,
@@ -1527,10 +1545,50 @@ const ICON_SECONDS: f32 = 0.26;
 const STAGGER_SECONDS: f32 = 0.03;
 const STAGGERED: usize = 16;
 
-/// How far an icon's pop-in has come, 0 before it starts and 1 when it rests.
-fn spawn_progress(start: std::time::Instant, index: usize) -> f32 {
-    let delay = index.min(STAGGERED) as f32 * STAGGER_SECONDS;
+/// How a popup moves while it opens: its window's rise in pixels at 96 DPI, whether its icons
+/// animate too, and whether they do so one after another.
+fn motion(animation: Animation) -> (i32, bool, bool) {
+    match animation {
+        Animation::Pop => (8, true, true),
+        Animation::Fade => (0, false, false),
+        Animation::Slide => (24, false, false),
+        Animation::Zoom => (0, true, false),
+        Animation::Cascade => (0, true, true),
+    }
+}
+
+/// How far an icon's entrance has come, 0 before it starts and 1 when it rests.
+fn spawn_progress(start: std::time::Instant, index: usize, animation: Animation) -> f32 {
+    let (_, _, staggered) = motion(animation);
+    let delay = if staggered {
+        index.min(STAGGERED) as f32 * STAGGER_SECONDS
+    } else {
+        0.0
+    };
     ((start.elapsed().as_secs_f32() - delay) / ICON_SECONDS).clamp(0.0, 1.0)
+}
+
+fn ease_out(progress: f32) -> f32 {
+    1.0 - (1.0 - progress).powi(3)
+}
+
+/// An entering icon's scale, and how far above its place it is in pixels at 96 DPI.
+fn icon_motion(animation: Animation, progress: f32) -> (f32, f32) {
+    match animation {
+        Animation::Pop => (pop_scale(progress), 0.0),
+        Animation::Zoom => (0.6 + 0.4 * ease_out(progress), 0.0),
+        Animation::Cascade => (1.0, -14.0 * (1.0 - ease_out(progress))),
+        Animation::Fade | Animation::Slide => (1.0, 0.0),
+    }
+}
+
+/// Seconds until every part of an opening has come to rest.
+fn opening_seconds(animation: Animation) -> f32 {
+    match motion(animation) {
+        (_, false, _) => POP_SECONDS,
+        (_, true, false) => POP_SECONDS.max(ICON_SECONDS),
+        (_, true, true) => POP_SECONDS.max(STAGGERED as f32 * STAGGER_SECONDS + ICON_SECONDS),
+    }
 }
 
 /// Icon scale while popping in: grows from 40% and overshoots a little, an ease-out-back.
@@ -1539,9 +1597,9 @@ fn pop_scale(progress: f32) -> f32 {
     0.4 + 0.6 * (1.0 + 2.701_58 * t * t * t + 1.701_58 * t * t)
 }
 
-/// Opens a layered popup like a Tailwind transition on opacity and translate: it fades in while
-/// rising a few pixels, and its icons pop in one after another.
-pub fn animate_in(window: HWND, list: HWND) {
+/// Opens a layered popup like a Tailwind transition on opacity and translate. The original Pop
+/// fades it in while rising a few pixels, and its icons pop in one after another.
+pub fn animate_in(window: HWND, list: HWND, animation: Animation) {
     unsafe {
         let mut bounds = RECT::default();
         if GetWindowRect(window, &mut bounds).is_err() {
@@ -1550,21 +1608,24 @@ pub fn animate_in(window: HWND, list: HWND) {
         let _ = SetLayeredWindowAttributes(window, COLORREF(0), 0, LWA_ALPHA);
         set_edge_opacity(window, 0);
         let start = std::time::Instant::now();
+        let (rise, icons, _) = motion(animation);
         LOOKS.with_borrow_mut(|looks| {
             if let Some(look) = looks.get_mut(&(list.0 as usize)) {
-                look.spawn = Some(start);
+                look.spawn = icons.then_some((start, animation));
             }
         });
         let resting = POINT {
             x: bounds.left,
             y: bounds.top,
         };
-        POPS.with_borrow_mut(|pops| pops.insert(window.0 as usize, (start, resting, list)));
+        POPS.with_borrow_mut(|pops| {
+            pops.insert(window.0 as usize, (start, resting, list, animation))
+        });
         let _ = SetWindowPos(
             window,
             None,
             resting.x,
-            resting.y + scale(8, GetDpiForWindow(window).max(96)),
+            resting.y + scale(rise, GetDpiForWindow(window).max(96)),
             0,
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
@@ -1574,7 +1635,7 @@ pub fn animate_in(window: HWND, list: HWND) {
 }
 
 unsafe fn step_pop(window: HWND) {
-    let Some((start, resting, list)) =
+    let Some((start, resting, list, animation)) =
         POPS.with_borrow(|pops| pops.get(&(window.0 as usize)).copied())
     else {
         let _ = KillTimer(Some(window), POP_TIMER);
@@ -1585,7 +1646,7 @@ unsafe fn step_pop(window: HWND) {
     let opacity = (eased * 255.0).round() as u8;
     let _ = SetLayeredWindowAttributes(window, COLORREF(0), opacity, LWA_ALPHA);
     set_edge_opacity(window, opacity);
-    let rise = scale(8, GetDpiForWindow(window).max(96)) as f32 * (1.0 - eased);
+    let rise = scale(motion(animation).0, GetDpiForWindow(window).max(96)) as f32 * (1.0 - eased);
     let _ = SetWindowPos(
         window,
         None,
@@ -1596,7 +1657,7 @@ unsafe fn step_pop(window: HWND) {
         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
     );
     let _ = InvalidateRect(Some(list), None, false);
-    if elapsed >= POP_SECONDS.max(STAGGERED as f32 * STAGGER_SECONDS + ICON_SECONDS) {
+    if elapsed >= opening_seconds(animation) {
         let _ = KillTimer(Some(window), POP_TIMER);
         POPS.with_borrow_mut(|pops| pops.remove(&(window.0 as usize)));
         LOOKS.with_borrow_mut(|looks| {
@@ -3994,5 +4055,16 @@ mod tests {
         assert_eq!(side, 20, "the next rendered size up");
         assert_eq!(pixels[0] >> 24, 0, "a check mark leaves its corner empty");
         assert!(pixels.contains(&0xFFFF_0000), "opaque red strokes");
+    }
+
+    #[test]
+    fn every_opening_animation_ends_with_icons_at_rest() {
+        for (animation, _) in appstack::model::ANIMATIONS {
+            assert_eq!(icon_motion(animation, 1.0), (1.0, 0.0), "{animation:?}");
+            assert!(opening_seconds(animation) >= POP_SECONDS);
+        }
+        // The original keeps its overshoot; Cascade starts above its place.
+        assert!(pop_scale(0.8) > 1.0);
+        assert!(icon_motion(Animation::Cascade, 0.0).1 < 0.0);
     }
 }

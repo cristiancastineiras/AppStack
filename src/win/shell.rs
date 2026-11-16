@@ -2,6 +2,7 @@
 
 use appstack::{model::*, storage::Store};
 use std::{
+    collections::HashMap,
     mem::{ManuallyDrop, size_of},
     path::{Path, PathBuf},
 };
@@ -262,14 +263,10 @@ pub fn window_app_id(window: HWND, identity: &str) -> Result<(), String> {
     }
 }
 
+/// Saves the group's shortcut under its current name, removing the one a rename left behind.
 pub fn shortcut(store: &Store, group: &Group, icon: Option<&Path>) -> Result<PathBuf, String> {
     let folder = store.root.join("shortcuts").join(&group.id);
     std::fs::create_dir_all(&folder).map_err(failure)?;
-    let previous = std::fs::read_dir(&folder)
-        .map_err(failure)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|extension| extension == "lnk"));
     let sanitized: String = group
         .name
         .chars()
@@ -282,13 +279,11 @@ pub fn shortcut(store: &Store, group: &Group, icon: Option<&Path>) -> Result<Pat
             }
         })
         .collect();
-    let path = previous.unwrap_or_else(|| {
-        folder.join(format!(
-            "{} - {}.lnk",
-            crate::APP_NAME,
-            sanitized.trim_end_matches([' ', '.'])
-        ))
-    });
+    let path = folder.join(format!(
+        "{} - {}.lnk",
+        crate::APP_NAME,
+        sanitized.trim_end_matches([' ', '.'])
+    ));
     unsafe {
         let link = make_link(
             store,
@@ -308,7 +303,110 @@ pub fn shortcut(store: &Store, group: &Group, icon: Option<&Path>) -> Result<Pat
             None,
         );
     }
+    for old in std::fs::read_dir(&folder)
+        .map_err(failure)?
+        .filter_map(Result::ok)
+    {
+        let old = old.path();
+        if old != path && old.extension().is_some_and(|extension| extension == "lnk") {
+            let _ = std::fs::remove_file(old);
+        }
+    }
     Ok(path)
+}
+
+/// Where Windows keeps its copies of the shortcuts pinned to the taskbar.
+fn pinned_folder() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|root| {
+        PathBuf::from(root).join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar")
+    })
+}
+
+/// The group a shortcut file opens, when it is one of this profile's group shortcuts.
+pub fn link_group(store: &Store, path: &Path) -> Option<String> {
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        link.cast::<IPersistFile>()
+            .ok()?
+            .Load(PCWSTR(wide(path).as_ptr()), STGM_READ)
+            .ok()?;
+        let mut buffer = vec![0u16; 2048];
+        link.GetArguments(&mut buffer).ok()?;
+        let arguments = String::from_utf16_lossy(&buffer[..buffer.iter().position(|v| *v == 0)?]);
+        group_argument(&arguments, store)
+    }
+}
+
+/// The group id in shortcut arguments `make_link` wrote for `store`.
+fn group_argument(arguments: &str, store: &Store) -> Option<String> {
+    let profile = format!("--data-dir \"{}\"", store.root.display());
+    let (id, rest) = arguments.strip_prefix("--group ")?.split_once(' ')?;
+    (rest == profile).then(|| id.to_string())
+}
+
+/// This profile's group shortcuts on the desktop and pinned to the taskbar, by group id. They
+/// are found by what they open, so a copy the user renamed is found too.
+pub fn group_copies(store: &Store) -> HashMap<String, Vec<PathBuf>> {
+    let mut copies: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for folder in desktop().ok().into_iter().chain(pinned_folder()) {
+        for file in std::fs::read_dir(folder)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+        {
+            let path = file.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
+            {
+                if let Some(id) = link_group(store, &path) {
+                    copies.entry(id).or_default().push(path);
+                }
+            }
+        }
+    }
+    copies
+}
+
+/// Brings copies of a group's shortcut up to date with it. A desktop copy also takes the new
+/// name; a taskbar pin keeps its file name, since the pin refers to that file.
+pub fn refresh_copies(shortcut: &Path, copies: &[PathBuf]) {
+    let Ok(bytes) = std::fs::read(shortcut) else {
+        return;
+    };
+    let pinned = pinned_folder();
+    for copy in copies {
+        let folder = copy.parent().unwrap_or(Path::new(""));
+        let renamed = folder.join(shortcut.file_name().unwrap_or_default());
+        let target = if pinned.as_deref() != Some(folder) && !renamed.exists() {
+            renamed
+        } else {
+            copy.clone()
+        };
+        if target == *copy && std::fs::read(copy).is_ok_and(|current| current == bytes) {
+            continue;
+        }
+        if std::fs::write(&target, &bytes).is_ok() {
+            if target != *copy {
+                let _ = std::fs::remove_file(copy);
+            }
+            unsafe {
+                SHChangeNotify(
+                    SHCNE_UPDATEITEM,
+                    SHCNF_PATHW,
+                    Some(wide(&target).as_ptr().cast()),
+                    None,
+                );
+            }
+        }
+    }
+}
+
+/// Tells Explorer its icons changed, so it drops the ones it cached.
+pub fn refresh_icon_cache() {
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+    }
 }
 
 unsafe fn make_link(
@@ -447,6 +545,19 @@ pub fn tray(
         let length = (title.len() - 1).min(data.szTip.len() - 1);
         data.szTip[..length].copy_from_slice(&title[..length]);
         let _ = Shell_NotifyIconW(operation, &data);
+    }
+}
+
+/// Where a tray icon is on screen.
+pub fn tray_bounds(owner: HWND, id: u32) -> Option<RECT> {
+    unsafe {
+        Shell_NotifyIconGetRect(&NOTIFYICONIDENTIFIER {
+            cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
+            hWnd: owner,
+            uID: id,
+            ..Default::default()
+        })
+        .ok()
     }
 }
 
@@ -613,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn shortcuts_preserve_identifiers_and_paths_after_rename() {
+    fn renamed_shortcuts_follow_the_group_name_and_keep_identifiers() {
         let _apartment = Apartment::new().unwrap();
         let store = Store {
             root: std::env::temp_dir().join(format!("AppStack shortcut test {}", new_id())),
@@ -623,9 +734,35 @@ mod tests {
             ..Group::default()
         };
         let first = shortcut(&store, &group, None).unwrap();
+        // A copy on the desktop, made before the rename.
+        let desktop = store.root.join("Desktop");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let copy = desktop.join(first.file_name().unwrap());
+        std::fs::copy(&first, &copy).unwrap();
+        assert_eq!(
+            link_group(&store, &copy).as_deref(),
+            Some(group.id.as_str())
+        );
         group.name = "Renamed tools".into();
         let second = shortcut(&store, &group, None).unwrap();
-        assert_eq!(first, second);
+        assert_ne!(first, second);
+        assert!(second.to_string_lossy().ends_with("Renamed tools.lnk"));
+        assert!(!first.exists(), "the old name does not linger");
+        refresh_copies(&second, std::slice::from_ref(&copy));
+        let renamed = desktop.join(second.file_name().unwrap());
+        assert!(!copy.exists() && renamed.is_file());
+        assert_eq!(
+            std::fs::read(&renamed).unwrap(),
+            std::fs::read(&second).unwrap()
+        );
+        let other = Store {
+            root: store.root.join("other"),
+        };
+        assert_eq!(
+            link_group(&other, &renamed),
+            None,
+            "other profiles are left alone"
+        );
         unsafe {
             let link: IShellLinkW =
                 CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
